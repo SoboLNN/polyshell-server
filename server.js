@@ -1,63 +1,231 @@
 // ============================================
-// PolyShell Signaling Server для Render.com
+// PolyShell Signaling Server
+// С серверным хранением пользователей
+// ============================================
+// Запуск: node server.js
+// Установка: npm install ws
 // ============================================
 
 const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
 
-// Render.com автоматически задаёт PORT через переменную окружения
-const PORT = process.env.PORT || 8080;
+// Создаём WebSocket сервер на порту 8080
+const wss = new WebSocket.Server({ port: 8080, host: '0.0.0.0' });
 
-// Создаём WebSocket сервер
-const wss = new WebSocket.Server({ 
-    port: PORT, 
-    host: '0.0.0.0' 
-});
+// Пути к файлам данных
+const DATA_DIR = path.join(__dirname, 'data');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
+const CONTACTS_FILE = path.join(DATA_DIR, 'contacts.json');
+
+// Создаём папку data если не существует
+if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+// Инициализация файлов данных
+function initDataFiles() {
+    if (!fs.existsSync(USERS_FILE)) {
+        fs.writeFileSync(USERS_FILE, JSON.stringify({}));
+    }
+    if (!fs.existsSync(MESSAGES_FILE)) {
+        fs.writeFileSync(MESSAGES_FILE, JSON.stringify({}));
+    }
+    if (!fs.existsSync(CONTACTS_FILE)) {
+        fs.writeFileSync(CONTACTS_FILE, JSON.stringify({}));
+    }
+}
+
+// Чтение данных
+function readData(file) {
+    try {
+        const data = fs.readFileSync(file, 'utf8');
+        return JSON.parse(data);
+    } catch (e) {
+        return {};
+    }
+}
+
+// Запись данных
+function writeData(file, data) {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
 
 // Хранилище подключений: телефон -> WebSocket
 const clients = new Map();
 
 console.log('🚀 ========================================');
 console.log('🚀 PolyShell Signaling Server');
-console.log(`🚀 Порт: ${PORT}`);
-console.log('🚀 Слушает: 0.0.0.0 (доступен из интернета)');
+console.log('🚀 Порт: 8080');
+console.log('🚀 Хранение: ' + DATA_DIR);
 console.log('🚀 ========================================\n');
 
+// Инициализация
+initDataFiles();
+
 // Обработка новых подключений
-wss.on('connection', (ws, req) => {
+wss.on('connection', (ws) => {
     const clientId = Math.random().toString(36).substr(2, 9);
-    const clientIp = req.socket.remoteAddress;
     let userPhone = null;
     
-    console.log(`🟢 [${clientId}] Новое подключение с ${clientIp}`);
+    console.log(`🟢 [${clientId}] Новое подключение`);
     
+    // Обработка входящих сообщений
     ws.on('message', (data) => {
         try {
             const message = JSON.parse(data);
             console.log(`\n📨 [${clientId}] Тип: ${message.type}`);
             
-            // Регистрация пользователя
-            if (message.phone && ['login', 'register', 'user_info'].includes(message.type)) {
+            // ============================================
+            // РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ (СЕРВЕРНАЯ)
+            // ============================================
+            if (message.type === 'register') {
+                const users = readData(USERS_FILE);
+                
+                // Проверка: существует ли уже пользователь
+                if (users[message.phone]) {
+                    ws.send(JSON.stringify({
+                        type: 'register_error',
+                        error: 'Пользователь с таким номером уже существует'
+                    }));
+                    console.log(`❌ [${clientId}] Регистрация failed: пользователь существует`);
+                    return;
+                }
+                
+                // Сохраняем пользователя на сервере
+                users[message.phone] = {
+                    name: message.name,
+                    phone: message.phone,
+                    password: message.password, // В продакшене нужно хешировать!
+                    avatar: message.avatar || '👤',
+                    status: 'онлайн',
+                    email: message.email || '',
+                    publicKey: message.publicKey || '',
+                    createdAt: new Date().toISOString(),
+                    lastSeen: new Date().toISOString()
+                };
+                
+                writeData(USERS_FILE, users);
+                
+                // Инициализируем хранилище сообщений для пользователя
+                const allMessages = readData(MESSAGES_FILE);
+                allMessages[message.phone] = [];
+                writeData(MESSAGES_FILE, allMessages);
+                
+                console.log(`✅ [${clientId}] Зарегистрирован: ${message.phone}`);
+                
+                ws.send(JSON.stringify({
+                    type: 'register_success',
+                    user: {
+                        phone: message.phone,
+                        name: message.name,
+                        avatar: message.avatar || '👤',
+                        status: 'онлайн',
+                        email: message.email || ''
+                    }
+                }));
+            }
+            
+            // ============================================
+            // ВХОД ПОЛЬЗОВАТЕЛЯ (СЕРВЕРНАЯ ПРОВЕРКА)
+            // ============================================
+            if (message.type === 'login') {
+                const users = readData(USERS_FILE);
+                
+                // Проверка: существует ли пользователь
+                if (!users[message.phone]) {
+                    ws.send(JSON.stringify({
+                        type: 'login_error',
+                        error: 'Аккаунт не найден'
+                    }));
+                    console.log(`❌ [${clientId}] Вход failed: аккаунт не найден`);
+                    return;
+                }
+                
+                // Проверка пароля
+                if (users[message.phone].password !== message.password) {
+                    ws.send(JSON.stringify({
+                        type: 'login_error',
+                        error: 'Неверный пароль'
+                    }));
+                    console.log(`❌ [${clientId}] Вход failed: неверный пароль`);
+                    return;
+                }
+                
+                // Успешный вход
                 userPhone = message.phone;
                 clients.set(userPhone, ws);
                 ws.phone = userPhone;
                 ws.id = clientId;
                 
-                console.log(`✅ [${clientId}] Зарегистрирован: ${userPhone}`);
+                // Обновляем статус
+                users[message.phone].status = 'онлайн';
+                users[message.phone].lastSeen = new Date().toISOString();
+                writeData(USERS_FILE, users);
+                
+                console.log(`✅ [${clientId}] Вошёл: ${message.phone}`);
                 console.log(`📋 Всего клиентов: ${clients.size}`);
                 console.log(`📋 В сети: ${Array.from(clients.keys()).join(', ')}`);
                 
                 ws.send(JSON.stringify({
                     type: 'login_success',
-                    phone: userPhone
+                    user: {
+                        phone: users[message.phone].phone,
+                        name: users[message.phone].name,
+                        avatar: users[message.phone].avatar,
+                        status: 'онлайн',
+                        email: users[message.phone].email || ''
+                    }
                 }));
             }
             
-            // Пересылка сообщений
-            if (message.type === 'message') {
+            // ============================================
+            // ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ
+            // ============================================
+            if (message.phone && message.type === 'user_info') {
+                userPhone = message.phone;
+                clients.set(userPhone, ws);
+                ws.phone = userPhone;
+                ws.id = clientId;
+                
+                const users = readData(USERS_FILE);
+                if (users[message.phone]) {
+                    users[message.phone].status = 'онлайн';
+                    users[message.phone].lastSeen = new Date().toISOString();
+                    if (message.user) {
+                        users[message.phone] = { ...users[message.phone], ...message.user };
+                    }
+                    writeData(USERS_FILE, users);
+                }
+                
+                console.log(`✅ [${clientId}] Обновлён: ${message.phone}`);
+                console.log(`📋 Всего клиентов: ${clients.size}`);
+            }
+            
+            // ============================================
+            // ПЕРЕСЫЛКА СООБЩЕНИЙ (С СЕРВЕРНЫМ ХРАНЕНИЕМ)
+            // ============================================
+            if (message.type === 'message' || message.type === 'chat') {
                 console.log(`📤 [${clientId}] Сообщение:`);
                 console.log(`   От: ${message.from}`);
                 console.log(`   Кому: ${message.to}`);
-                console.log(`   Текст: ${message.content}`);
+                console.log(`   Текст: ${message.content.substring(0, 50)}...`);
+                
+                // Сохраняем сообщение на сервере
+                const allMessages = readData(MESSAGES_FILE);
+                if (!allMessages[message.to]) {
+                    allMessages[message.to] = [];
+                }
+                allMessages[message.to].push({
+                    from: message.from,
+                    fromName: message.fromName,
+                    content: message.content,
+                    timestamp: message.timestamp,
+                    type: message.type,
+                    encrypted: message.encrypted || false
+                });
+                writeData(MESSAGES_FILE, allMessages);
                 
                 const recipient = clients.get(message.to);
                 
@@ -67,34 +235,41 @@ wss.on('connection', (ws, req) => {
                         from: message.from,
                         fromName: message.fromName || message.from,
                         content: message.content,
-                        timestamp: message.timestamp || new Date().toISOString()
+                        timestamp: message.timestamp || new Date().toISOString(),
+                        encrypted: message.encrypted || false
                     };
                     
                     recipient.send(JSON.stringify(forwardMessage));
                     console.log(`✅ [${clientId}] ДОСТАВЛЕНО получателю ${message.to}`);
                 } else {
-                    console.log(`❌ [${clientId}] НЕ ДОСТАВЛЕНО`);
-                    console.log(`   Получатель ${message.to} не найден или оффлайн`);
+                    console.log(`❌ [${clientId}] НЕ ДОСТАВЛЕНО - получатель оффлайн`);
                 }
             }
             
-            // Поиск пользователя
+            // ============================================
+            // ПОИСК ПОЛЬЗОВАТЕЛЯ
+            // ============================================
             if (message.type === 'find_user') {
-                const found = clients.has(message.phone);
+                const users = readData(USERS_FILE);
+                const found = users[message.phone];
+                
                 console.log(`🔍 [${clientId}] Поиск ${message.phone}: ${found ? 'НАЙДЕН' : 'НЕ НАЙДЕН'}`);
                 
                 ws.send(JSON.stringify({
                     type: found ? 'user_found' : 'user_not_found',
                     user: found ? { 
-                        phone: message.phone, 
-                        name: message.phone, 
-                        status: 'онлайн',
-                        avatar: '👤'
+                        phone: found.phone, 
+                        name: found.name, 
+                        status: clients.has(found.phone) ? 'онлайн' : 'оффлайн',
+                        avatar: found.avatar || '👤',
+                        publicKey: found.publicKey || ''
                     } : null
                 }));
             }
             
-            // Создание чата
+            // ============================================
+            // СОЗДАНИЕ ЧАТА
+            // ============================================
             if (message.type === 'create_chat') {
                 console.log(`📝 [${clientId}] Создание чата: ${userPhone} → ${message.to}`);
                 
@@ -110,7 +285,9 @@ wss.on('connection', (ws, req) => {
                 }
             }
             
-            // Индикатор набора текста
+            // ============================================
+            // ИНДИКАТОР НАБОРА ТЕКСТА
+            // ============================================
             if (message.type === 'typing') {
                 const recipient = clients.get(message.to);
                 if (recipient) {
@@ -121,7 +298,9 @@ wss.on('connection', (ws, req) => {
                 }
             }
             
-            // WebRTC сигналинг
+            // ============================================
+            // WEBRTC СИГНАЛИНГ (звонки)
+            // ============================================
             if (['offer', 'answer', 'ice-candidate'].includes(message.type)) {
                 console.log(`📞 [${clientId}] WebRTC: ${message.type} → ${message.to}`);
                 
@@ -137,7 +316,9 @@ wss.on('connection', (ws, req) => {
                 }
             }
             
-            // Завершение звонка
+            // ============================================
+            // ЗАВЕРШЕНИЕ ЗВОНКА
+            // ============================================
             if (message.type === 'call_ended') {
                 const recipient = clients.get(message.to);
                 if (recipient) {
@@ -148,32 +329,76 @@ wss.on('connection', (ws, req) => {
                 }
             }
             
+            // ============================================
+            // ОБНОВЛЕНИЕ ПРОФИЛЯ
+            // ============================================
+            if (message.type === 'update_profile') {
+                const users = readData(USERS_FILE);
+                if (users[message.user.phone]) {
+                    users[message.user.phone] = {
+                        ...users[message.user.phone],
+                        ...message.user
+                    };
+                    writeData(USERS_FILE, users);
+                    console.log(`✅ [${clientId}] Профиль обновлён: ${message.user.phone}`);
+                }
+            }
+            
+            // ============================================
+            // СМЕНА ПАРОЛЯ
+            // ============================================
+            if (message.type === 'change_password') {
+                const users = readData(USERS_FILE);
+                if (users[message.phone]) {
+                    users[message.phone].password = message.newPassword;
+                    writeData(USERS_FILE, users);
+                    console.log(`✅ [${clientId}] Пароль изменён: ${message.phone}`);
+                    ws.send(JSON.stringify({
+                        type: 'password_changed',
+                        success: true
+                    }));
+                }
+            }
+            
         } catch (e) {
             console.error(`❌ [${clientId}] Ошибка парсинга:`, e.message);
         }
     });
     
+    // Обработка отключения
     ws.on('close', () => {
         console.log(`\n🔴 [${clientId}] Отключился`);
         if (userPhone) {
             clients.delete(userPhone);
+            
+            // Обновляем статус на оффлайн
+            const users = readData(USERS_FILE);
+            if (users[userPhone]) {
+                users[userPhone].status = 'оффлайн';
+                users[userPhone].lastSeen = new Date().toISOString();
+                writeData(USERS_FILE, users);
+            }
+            
             console.log(`🗑️ Удалён из системы: ${userPhone}`);
             console.log(`📋 Осталось клиентов: ${clients.size}`);
         }
     });
     
+    // Обработка ошибок
     ws.on('error', (err) => {
         console.error(`⚠️ [${clientId}] Ошибка:`, err.message);
     });
     
-    // Heartbeat
+    // Heartbeat для поддержания соединения
     ws.isAlive = true;
     ws.on('pong', () => {
         ws.isAlive = true;
     });
 });
 
-// Проверка активных соединений
+// ============================================
+// ПРОВЕРКА АКТИВНЫХ СОЕДИНЕНИЙ
+// ============================================
 const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
         if (ws.isAlive === false) {
@@ -191,7 +416,12 @@ wss.on('close', () => {
     clearInterval(interval);
 });
 
+// ============================================
+// ЗАПУСК СЕРВЕРА
+// ============================================
 console.log('\n📡 Ожидание подключений...\n');
-console.log('💡 URL для подключения:');
-console.log(`   wss://ВАШ_DOMAIN.onrender.com`);
-console.log('\n⚠️ Не забудьте вставить этот URL в HTML файл!\n');
+console.log('💡 Для подключения используйте:');
+console.log('   ws://localhost:8080 (локально)');
+console.log('   ws://ВАШ_IP:8080 (из сети)');
+console.log('   wss://ВАШ_ДОМЕН (интернет)\n');
+console.log('📁 Данные сохраняются в: ' + DATA_DIR + '\n');
