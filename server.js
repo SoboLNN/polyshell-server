@@ -1,6 +1,6 @@
 // ============================================
 // PolyShell Signaling Server
-// С серверным хранением пользователей
+// С серверным хранением пользователей и публичных ключей
 // ============================================
 // Запуск: node server.js
 // Установка: npm install ws
@@ -56,7 +56,7 @@ function writeData(file, data) {
 const clients = new Map();
 
 console.log('🚀 ========================================');
-console.log('🚀 PolyShell Signaling Server');
+console.log('🚀 PolyShell Signaling Server (with key storage)');
 console.log('🚀 Порт: 8080');
 console.log('🚀 Хранение: ' + DATA_DIR);
 console.log('🚀 ========================================\n');
@@ -93,7 +93,7 @@ wss.on('connection', (ws) => {
                     return;
                 }
                 
-                // Сохраняем пользователя на сервере
+                // Сохраняем пользователя на сервере (включая публичный ключ)
                 users[message.phone] = {
                     name: message.name,
                     phone: message.phone,
@@ -101,7 +101,7 @@ wss.on('connection', (ws) => {
                     avatar: message.avatar || '👤',
                     status: 'онлайн',
                     email: message.email || '',
-                    publicKey: message.publicKey || '',
+                    publicKey: message.publicKey || '',   // ← ключ при регистрации
                     createdAt: new Date().toISOString(),
                     lastSeen: new Date().toISOString()
                 };
@@ -114,6 +114,7 @@ wss.on('connection', (ws) => {
                 writeData(MESSAGES_FILE, allMessages);
                 
                 console.log(`✅ [${clientId}] Зарегистрирован: ${message.phone}`);
+                console.log(`🔑 Публичный ключ сохранён: ${message.publicKey ? 'да' : 'нет'}`);
                 
                 ws.send(JSON.stringify({
                     type: 'register_success',
@@ -122,7 +123,8 @@ wss.on('connection', (ws) => {
                         name: message.name,
                         avatar: message.avatar || '👤',
                         status: 'онлайн',
-                        email: message.email || ''
+                        email: message.email || '',
+                        publicKey: message.publicKey || ''
                     }
                 }));
             }
@@ -175,13 +177,14 @@ wss.on('connection', (ws) => {
                         name: users[message.phone].name,
                         avatar: users[message.phone].avatar,
                         status: 'онлайн',
-                        email: users[message.phone].email || ''
+                        email: users[message.phone].email || '',
+                        publicKey: users[message.phone].publicKey || ''
                     }
                 }));
             }
             
             // ============================================
-            // ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ
+            // ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ (обновление профиля)
             // ============================================
             if (message.phone && message.type === 'user_info') {
                 userPhone = message.phone;
@@ -204,13 +207,48 @@ wss.on('connection', (ws) => {
             }
             
             // ============================================
+            // УСТАНОВКА ПУБЛИЧНОГО КЛЮЧА (если не был передан при регистрации)
+            // ============================================
+            if (message.type === 'set_public_key') {
+                const users = readData(USERS_FILE);
+                const phone = message.from || userPhone;
+                if (phone && users[phone]) {
+                    users[phone].publicKey = message.publicKey;
+                    writeData(USERS_FILE, users);
+                    console.log(`🔑 [${clientId}] Сохранён публичный ключ для ${phone}`);
+                    ws.send(JSON.stringify({
+                        type: 'public_key_saved',
+                        success: true
+                    }));
+                }
+            }
+            
+            // ============================================
+            // ЗАПРОС ПУБЛИЧНОГО КЛЮЧА ДРУГОГО ПОЛЬЗОВАТЕЛЯ
+            // ============================================
+            if (message.type === 'get_public_key') {
+                const users = readData(USERS_FILE);
+                const targetPhone = message.targetPhone;
+                const targetUser = users[targetPhone];
+                const publicKey = targetUser ? targetUser.publicKey : null;
+                
+                console.log(`🔑 [${clientId}] Запрос ключа для ${targetPhone}: ${publicKey ? 'найден' : 'не найден'}`);
+                
+                ws.send(JSON.stringify({
+                    type: 'public_key_response',
+                    phone: targetPhone,
+                    publicKey: publicKey || null
+                }));
+            }
+            
+            // ============================================
             // ПЕРЕСЫЛКА СООБЩЕНИЙ (С СЕРВЕРНЫМ ХРАНЕНИЕМ)
             // ============================================
-            if (message.type === 'message' || message.type === 'chat') {
+            if (message.type === 'message' || message.type === 'chat_message') {
                 console.log(`📤 [${clientId}] Сообщение:`);
                 console.log(`   От: ${message.from}`);
                 console.log(`   Кому: ${message.to}`);
-                console.log(`   Текст: ${message.content.substring(0, 50)}...`);
+                console.log(`   Текст: ${message.content ? message.content.substring(0, 50) : '...'}`);
                 
                 // Сохраняем сообщение на сервере
                 const allMessages = readData(MESSAGES_FILE);
@@ -225,13 +263,14 @@ wss.on('connection', (ws) => {
                     type: message.type,
                     encrypted: message.encrypted || false
                 });
+                // Сохраняем также входящее сообщение для отправителя? Не обязательно
                 writeData(MESSAGES_FILE, allMessages);
                 
                 const recipient = clients.get(message.to);
                 
                 if (recipient && recipient.readyState === WebSocket.OPEN) {
                     const forwardMessage = {
-                        type: 'message',
+                        type: 'chat_message',
                         from: message.from,
                         fromName: message.fromName || message.from,
                         content: message.content,
@@ -273,6 +312,18 @@ wss.on('connection', (ws) => {
             if (message.type === 'create_chat') {
                 console.log(`📝 [${clientId}] Создание чата: ${userPhone} → ${message.to}`);
                 
+                // Сохраняем контакт в contacts.json (для обоих пользователей)
+                const contacts = readData(CONTACTS_FILE);
+                if (!contacts[userPhone]) contacts[userPhone] = [];
+                if (!contacts[userPhone].includes(message.to)) {
+                    contacts[userPhone].push(message.to);
+                }
+                if (!contacts[message.to]) contacts[message.to] = [];
+                if (!contacts[message.to].includes(userPhone)) {
+                    contacts[message.to].push(userPhone);
+                }
+                writeData(CONTACTS_FILE, contacts);
+                
                 const recipient = clients.get(message.to);
                 if (recipient) {
                     recipient.send(JSON.stringify({
@@ -283,6 +334,30 @@ wss.on('connection', (ws) => {
                     }));
                     console.log(`✅ [${clientId}] Уведомление о чате отправлено`);
                 }
+            }
+            
+            // ============================================
+            // ПОЛУЧЕНИЕ СПИСКА КОНТАКТОВ
+            // ============================================
+            if (message.type === 'get_contacts') {
+                const contacts = readData(CONTACTS_FILE);
+                const userContacts = contacts[userPhone] || [];
+                ws.send(JSON.stringify({
+                    type: 'contacts_list',
+                    contacts: userContacts
+                }));
+            }
+            
+            // ============================================
+            // ПОЛУЧЕНИЕ ИСТОРИИ СООБЩЕНИЙ
+            // ============================================
+            if (message.type === 'get_messages') {
+                const allMessages = readData(MESSAGES_FILE);
+                const userMessages = allMessages[userPhone] || [];
+                ws.send(JSON.stringify({
+                    type: 'messages_history',
+                    messages: userMessages
+                }));
             }
             
             // ============================================
