@@ -83,6 +83,12 @@ wss.on('connection', (ws) => {
                     }
                 }));
                 console.log(`✅ [${clientId}] Зарегистрирован ${phone}`);
+
+                // Устанавливаем userPhone для этого подключения (важно!)
+                userPhone = phone;
+                clients.set(userPhone, ws);
+                ws.phone = userPhone;
+                ws.id = clientId;
             }
 
             // ========== ВХОД ==========
@@ -176,6 +182,8 @@ wss.on('connection', (ws) => {
                     if (recipient) {
                         recipient.send(JSON.stringify({ type: 'create_chat', from, fromName: from, to }));
                     }
+                } else {
+                    console.log(`⚠️ [${clientId}] Некорректные данные create_chat: from=${from}, to=${to}`);
                 }
             }
 
