@@ -1,39 +1,48 @@
 const WebSocket = require('ws');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 
 const PORT = process.env.PORT || 8080;
-const DATA_DIR = path.join(__dirname, 'data');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const CONTACTS_FILE = path.join(DATA_DIR, 'contacts.json');
-const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-
-function readUsers() {
-    try {
-        return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
-    } catch { return {}; }
+async function initDatabase() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+            phone VARCHAR(20) PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            password VARCHAR(255) NOT NULL,
+            avatar VARCHAR(10) DEFAULT '👤',
+            status VARCHAR(20) DEFAULT 'онлайн',
+            email VARCHAR(255),
+            public_key TEXT,
+            settings JSONB DEFAULT '{"profileVisibility":"all","lastSeenVisibility":"all","soundEnabled":true,"vibrationEnabled":true,"messagePreview":true,"theme":"system"}',
+            created_at TIMESTAMP DEFAULT NOW(),
+            last_seen TIMESTAMP DEFAULT NOW()
+        )
+    `);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS contacts (
+            user_phone VARCHAR(20) NOT NULL,
+            contact_phone VARCHAR(20) NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (user_phone, contact_phone)
+        )
+    `);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            from_phone VARCHAR(20) NOT NULL,
+            to_phone VARCHAR(20) NOT NULL,
+            content TEXT NOT NULL,
+            encrypted BOOLEAN DEFAULT true,
+            timestamp TIMESTAMP DEFAULT NOW()
+        )
+    `);
+    console.log('✅ База данных инициализирована');
 }
-function writeUsers(data) {
-    fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2));
-}
-function readContacts() {
-    try {
-        return JSON.parse(fs.readFileSync(CONTACTS_FILE, 'utf8'));
-    } catch { return {}; }
-}
-function writeContacts(data) {
-    fs.writeFileSync(CONTACTS_FILE, JSON.stringify(data, null, 2));
-}
-function readMessages() {
-    try {
-        return JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8'));
-    } catch { return []; }
-}
-function writeMessages(data) {
-    fs.writeFileSync(MESSAGES_FILE, JSON.stringify(data, null, 2));
-}
+initDatabase().catch(console.error);
 
 const clients = new Map();
 const wss = new WebSocket.Server({ port: PORT, host: '0.0.0.0' });
@@ -51,40 +60,33 @@ wss.on('connection', (ws) => {
             // ========== РЕГИСТРАЦИЯ ==========
             if (msg.type === 'register') {
                 const { phone, name, password, avatar, email, publicKey } = msg;
-                const users = readUsers();
-                if (users[phone]) {
+                const existing = await pool.query('SELECT phone FROM users WHERE phone = $1', [phone]);
+                if (existing.rows.length > 0) {
                     ws.send(JSON.stringify({ type: 'register_error', error: 'Пользователь уже существует' }));
                     return;
                 }
-                users[phone] = {
-                    name, phone, password,
-                    avatar: avatar || '👤',
-                    status: 'онлайн',
-                    email: email || '',
-                    publicKey: publicKey || '',
-                    settings: {
-                        profileVisibility: 'all',
-                        lastSeenVisibility: 'all',
-                        soundEnabled: true,
-                        vibrationEnabled: true,
-                        messagePreview: true,
-                        theme: 'system'
-                    },
-                    createdAt: new Date().toISOString(),
-                    lastSeen: new Date().toISOString()
-                };
-                writeUsers(users);
+                await pool.query(
+                    `INSERT INTO users (phone, name, password, avatar, email, public_key, settings)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                    [phone, name, password, avatar || '👤', email || '', publicKey || '',
+                     JSON.stringify({ profileVisibility: 'all', lastSeenVisibility: 'all', soundEnabled: true, vibrationEnabled: true, messagePreview: true, theme: 'system' })]
+                );
                 ws.send(JSON.stringify({
                     type: 'register_success',
                     user: {
                         phone, name, avatar: avatar || '👤', status: 'онлайн', email: email || '',
                         publicKey: publicKey || '',
-                        settings: users[phone].settings
+                        settings: {
+                            profileVisibility: 'all',
+                            lastSeenVisibility: 'all',
+                            soundEnabled: true,
+                            vibrationEnabled: true,
+                            messagePreview: true,
+                            theme: 'system'
+                        }
                     }
                 }));
                 console.log(`✅ [${clientId}] Зарегистрирован ${phone}`);
-
-                // Устанавливаем userPhone для этого подключения (важно!)
                 userPhone = phone;
                 clients.set(userPhone, ws);
                 ws.phone = userPhone;
@@ -94,19 +96,17 @@ wss.on('connection', (ws) => {
             // ========== ВХОД ==========
             if (msg.type === 'login') {
                 const { phone, password } = msg;
-                const users = readUsers();
-                const user = users[phone];
-                if (!user) {
+                const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+                if (user.rows.length === 0) {
                     ws.send(JSON.stringify({ type: 'login_error', error: 'Аккаунт не найден' }));
                     return;
                 }
-                if (user.password !== password) {
+                const userData = user.rows[0];
+                if (userData.password !== password) {
                     ws.send(JSON.stringify({ type: 'login_error', error: 'Неверный пароль' }));
                     return;
                 }
-                user.status = 'онлайн';
-                user.lastSeen = new Date().toISOString();
-                writeUsers(users);
+                await pool.query('UPDATE users SET status = $1, last_seen = NOW() WHERE phone = $2', ['онлайн', phone]);
                 userPhone = phone;
                 clients.set(userPhone, ws);
                 ws.phone = userPhone;
@@ -114,44 +114,59 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({
                     type: 'login_success',
                     user: {
-                        phone: user.phone,
-                        name: user.name,
-                        avatar: user.avatar,
+                        phone: userData.phone,
+                        name: userData.name,
+                        avatar: userData.avatar,
                         status: 'онлайн',
-                        email: user.email,
-                        publicKey: user.publicKey,
-                        settings: user.settings
+                        email: userData.email,
+                        publicKey: userData.public_key,
+                        settings: userData.settings
                     }
                 }));
                 console.log(`✅ [${clientId}] Вход ${phone}`);
+            }
+
+            // ========== ОБНОВЛЕНИЕ ИНФОРМАЦИИ О ПОЛЬЗОВАТЕЛЕ (восстановление после перезагрузки) ==========
+            if (msg.type === 'user_info') {
+                const phone = msg.phone;
+                if (phone) {
+                    const users = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+                    if (users.rows.length > 0) {
+                        userPhone = phone;
+                        clients.set(userPhone, ws);
+                        ws.phone = userPhone;
+                        ws.id = clientId;
+                        // Обновляем статус
+                        await pool.query('UPDATE users SET status = $1, last_seen = NOW() WHERE phone = $2', ['онлайн', phone]);
+                        console.log(`✅ [${clientId}] Информация о пользователе получена: ${phone}`);
+                    } else {
+                        console.log(`⚠️ [${clientId}] Неизвестный пользователь: ${phone}`);
+                    }
+                }
             }
 
             // ========== УСТАНОВКА ПУБЛИЧНОГО КЛЮЧА ==========
             if (msg.type === 'set_public_key') {
                 const phone = msg.from || userPhone;
                 if (phone) {
-                    const users = readUsers();
-                    if (users[phone]) {
-                        users[phone].publicKey = msg.publicKey;
-                        writeUsers(users);
-                        ws.send(JSON.stringify({ type: 'public_key_saved', success: true }));
-                        console.log(`🔑 [${clientId}] Ключ сохранён для ${phone}`);
-                    }
+                    await pool.query('UPDATE users SET public_key = $1 WHERE phone = $2', [msg.publicKey, phone]);
+                    ws.send(JSON.stringify({ type: 'public_key_saved', success: true }));
+                    console.log(`🔑 [${clientId}] Ключ сохранён для ${phone}`);
                 }
             }
 
             // ========== ЗАПРОС ПУБЛИЧНОГО КЛЮЧА ==========
             if (msg.type === 'get_public_key') {
-                const users = readUsers();
-                const publicKey = users[msg.targetPhone]?.publicKey || null;
+                const result = await pool.query('SELECT public_key FROM users WHERE phone = $1', [msg.targetPhone]);
+                const publicKey = result.rows[0]?.public_key || null;
                 ws.send(JSON.stringify({ type: 'public_key_response', phone: msg.targetPhone, publicKey }));
             }
 
             // ========== ПОИСК ПОЛЬЗОВАТЕЛЯ ==========
             if (msg.type === 'find_user') {
-                const users = readUsers();
-                const found = users[msg.phone];
-                if (found) {
+                const result = await pool.query('SELECT phone, name, avatar, status FROM users WHERE phone = $1', [msg.phone]);
+                if (result.rows.length > 0) {
+                    const found = result.rows[0];
                     ws.send(JSON.stringify({
                         type: 'user_found',
                         user: {
@@ -171,12 +186,8 @@ wss.on('connection', (ws) => {
                 const from = userPhone;
                 const to = msg.to;
                 if (from && to && from !== to) {
-                    const contacts = readContacts();
-                    if (!contacts[from]) contacts[from] = [];
-                    if (!contacts[from].includes(to)) contacts[from].push(to);
-                    if (!contacts[to]) contacts[to] = [];
-                    if (!contacts[to].includes(from)) contacts[to].push(from);
-                    writeContacts(contacts);
+                    await pool.query('INSERT INTO contacts (user_phone, contact_phone) VALUES ($1, $2) ON CONFLICT DO NOTHING', [from, to]);
+                    await pool.query('INSERT INTO contacts (user_phone, contact_phone) VALUES ($1, $2) ON CONFLICT DO NOTHING', [to, from]);
                     console.log(`📝 [${clientId}] Контакт сохранён: ${from} ↔ ${to}`);
                     const recipient = clients.get(to);
                     if (recipient) {
@@ -189,25 +200,32 @@ wss.on('connection', (ws) => {
 
             // ========== ПОЛУЧЕНИЕ КОНТАКТОВ ==========
             if (msg.type === 'get_contacts') {
-                const contacts = readContacts();
-                const userContacts = contacts[userPhone] || [];
-                ws.send(JSON.stringify({ type: 'contacts_list', contacts: userContacts }));
-                console.log(`📋 [${clientId}] Отправлены контакты: ${userContacts.join(', ')}`);
+                const result = await pool.query('SELECT contact_phone FROM contacts WHERE user_phone = $1', [userPhone]);
+                const contacts = result.rows.map(row => row.contact_phone);
+                ws.send(JSON.stringify({ type: 'contacts_list', contacts }));
+                console.log(`📋 [${clientId}] Отправлены контакты: ${contacts.join(', ')}`);
             }
 
             // ========== ИСТОРИЯ СООБЩЕНИЙ ==========
             if (msg.type === 'get_messages') {
-                const allMessages = readMessages();
-                const userMessages = allMessages.filter(m => m.from === userPhone || m.to === userPhone);
-                ws.send(JSON.stringify({ type: 'messages_history', messages: userMessages }));
+                const result = await pool.query(
+                    `SELECT from_phone, to_phone, content, encrypted, timestamp
+                     FROM messages
+                     WHERE from_phone = $1 OR to_phone = $1
+                     ORDER BY timestamp ASC`,
+                    [userPhone]
+                );
+                ws.send(JSON.stringify({ type: 'messages_history', messages: result.rows }));
             }
 
             // ========== ОТПРАВКА СООБЩЕНИЯ ==========
             if (msg.type === 'chat_message') {
                 const { from, fromName, to, content, encrypted, timestamp } = msg;
-                const allMessages = readMessages();
-                allMessages.push({ from, fromName, to, content, encrypted, timestamp: timestamp || new Date().toISOString() });
-                writeMessages(allMessages);
+                await pool.query(
+                    `INSERT INTO messages (from_phone, to_phone, content, encrypted, timestamp)
+                     VALUES ($1, $2, $3, $4, $5)`,
+                    [from, to, content, encrypted, timestamp || new Date().toISOString()]
+                );
                 const recipient = clients.get(to);
                 if (recipient) {
                     recipient.send(JSON.stringify({ type: 'chat_message', from, fromName, content, encrypted, timestamp }));
@@ -221,10 +239,17 @@ wss.on('connection', (ws) => {
             if (msg.type === 'update_profile') {
                 const { user } = msg;
                 if (user && user.phone) {
-                    const users = readUsers();
-                    if (users[user.phone]) {
-                        Object.assign(users[user.phone], user);
-                        writeUsers(users);
+                    const fields = [];
+                    const values = [];
+                    let idx = 1;
+                    if (user.name) { fields.push(`name = $${idx++}`); values.push(user.name); }
+                    if (user.avatar) { fields.push(`avatar = $${idx++}`); values.push(user.avatar); }
+                    if (user.status) { fields.push(`status = $${idx++}`); values.push(user.status); }
+                    if (user.email) { fields.push(`email = $${idx++}`); values.push(user.email); }
+                    if (user.settings) { fields.push(`settings = $${idx++}`); values.push(JSON.stringify(user.settings)); }
+                    if (fields.length > 0) {
+                        values.push(user.phone);
+                        await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE phone = $${idx}`, values);
                         console.log(`✅ [${clientId}] Профиль обновлён ${user.phone}`);
                     }
                 }
@@ -232,17 +257,10 @@ wss.on('connection', (ws) => {
 
             // ========== ПОЛУЧЕНИЕ ПРОФИЛЯ ==========
             if (msg.type === 'get_profile') {
-                const users = readUsers();
-                const user = users[msg.phone || userPhone];
-                if (user) {
-                    ws.send(JSON.stringify({
-                        type: 'profile_data',
-                        user: {
-                            phone: user.phone, name: user.name, avatar: user.avatar,
-                            status: user.status, email: user.email, publicKey: user.publicKey,
-                            settings: user.settings
-                        }
-                    }));
+                const phone = msg.phone || userPhone;
+                const result = await pool.query('SELECT phone, name, avatar, status, email, public_key, settings FROM users WHERE phone = $1', [phone]);
+                if (result.rows.length > 0) {
+                    ws.send(JSON.stringify({ type: 'profile_data', user: result.rows[0] }));
                 } else {
                     ws.send(JSON.stringify({ type: 'profile_error', error: 'Пользователь не найден' }));
                 }
@@ -274,12 +292,8 @@ wss.on('connection', (ws) => {
             }
 
             if (msg.type === 'change_password') {
-                const users = readUsers();
-                if (users[msg.phone]) {
-                    users[msg.phone].password = msg.newPassword;
-                    writeUsers(users);
-                    ws.send(JSON.stringify({ type: 'password_changed', success: true }));
-                }
+                await pool.query('UPDATE users SET password = $1 WHERE phone = $2', [msg.newPassword, msg.phone]);
+                ws.send(JSON.stringify({ type: 'password_changed', success: true }));
             }
 
         } catch (err) {
@@ -292,11 +306,7 @@ wss.on('connection', (ws) => {
         console.log(`🔴 [${clientId}] Отключился`);
         if (userPhone) {
             clients.delete(userPhone);
-            const users = readUsers();
-            if (users[userPhone]) {
-                users[userPhone].status = 'оффлайн';
-                writeUsers(users);
-            }
+            pool.query('UPDATE users SET status = $1 WHERE phone = $2', ['оффлайн', userPhone]).catch(console.error);
         }
     });
 
