@@ -10,22 +10,32 @@ const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-function init() {
-    if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, '{}');
-    if (!fs.existsSync(CONTACTS_FILE)) fs.writeFileSync(CONTACTS_FILE, '{}');
-    if (!fs.existsSync(MESSAGES_FILE)) fs.writeFileSync(MESSAGES_FILE, '[]');
+function readUsers() {
+    try {
+        return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+    } catch { return {}; }
 }
-init();
+function writeUsers(data) {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2));
+}
+function readContacts() {
+    try {
+        return JSON.parse(fs.readFileSync(CONTACTS_FILE, 'utf8'));
+    } catch { return {}; }
+}
+function writeContacts(data) {
+    fs.writeFileSync(CONTACTS_FILE, JSON.stringify(data, null, 2));
+}
+function readMessages() {
+    try {
+        return JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8'));
+    } catch { return []; }
+}
+function writeMessages(data) {
+    fs.writeFileSync(MESSAGES_FILE, JSON.stringify(data, null, 2));
+}
 
-function readUsers() { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); }
-function writeUsers(data) { fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2)); }
-function readContacts() { return JSON.parse(fs.readFileSync(CONTACTS_FILE, 'utf8')); }
-function writeContacts(data) { fs.writeFileSync(CONTACTS_FILE, JSON.stringify(data, null, 2)); }
-function readMessages() { return JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8')); }
-function writeMessages(data) { fs.writeFileSync(MESSAGES_FILE, JSON.stringify(data, null, 2)); }
-
-const clients = new Map(); // phone -> WebSocket
-
+const clients = new Map();
 const wss = new WebSocket.Server({ port: PORT, host: '0.0.0.0' });
 console.log(`🚀 Сервер запущен на порту ${PORT}`);
 
@@ -38,7 +48,7 @@ wss.on('connection', (ws) => {
             const msg = JSON.parse(data);
             console.log(`\n📨 [${clientId}] ${msg.type}`);
 
-            // ---------- РЕГИСТРАЦИЯ ----------
+            // ========== РЕГИСТРАЦИЯ ==========
             if (msg.type === 'register') {
                 const { phone, name, password, avatar, email, publicKey } = msg;
                 const users = readUsers();
@@ -75,7 +85,7 @@ wss.on('connection', (ws) => {
                 console.log(`✅ [${clientId}] Зарегистрирован ${phone}`);
             }
 
-            // ---------- ВХОД ----------
+            // ========== ВХОД ==========
             if (msg.type === 'login') {
                 const { phone, password } = msg;
                 const users = readUsers();
@@ -110,7 +120,7 @@ wss.on('connection', (ws) => {
                 console.log(`✅ [${clientId}] Вход ${phone}`);
             }
 
-            // ---------- УСТАНОВКА ПУБЛИЧНОГО КЛЮЧА ----------
+            // ========== УСТАНОВКА ПУБЛИЧНОГО КЛЮЧА ==========
             if (msg.type === 'set_public_key') {
                 const phone = msg.from || userPhone;
                 if (phone) {
@@ -124,14 +134,14 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ЗАПРОС ПУБЛИЧНОГО КЛЮЧА ----------
+            // ========== ЗАПРОС ПУБЛИЧНОГО КЛЮЧА ==========
             if (msg.type === 'get_public_key') {
                 const users = readUsers();
                 const publicKey = users[msg.targetPhone]?.publicKey || null;
                 ws.send(JSON.stringify({ type: 'public_key_response', phone: msg.targetPhone, publicKey }));
             }
 
-            // ---------- ПОИСК ПОЛЬЗОВАТЕЛЯ ----------
+            // ========== ПОИСК ПОЛЬЗОВАТЕЛЯ ==========
             if (msg.type === 'find_user') {
                 const users = readUsers();
                 const found = users[msg.phone];
@@ -150,11 +160,11 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- СОЗДАНИЕ ЧАТА (добавление контакта) ----------
+            // ========== СОЗДАНИЕ ЧАТА (сохранение контакта) ==========
             if (msg.type === 'create_chat') {
                 const from = userPhone;
                 const to = msg.to;
-                if (from && to) {
+                if (from && to && from !== to) {
                     const contacts = readContacts();
                     if (!contacts[from]) contacts[from] = [];
                     if (!contacts[from].includes(to)) contacts[from].push(to);
@@ -162,16 +172,14 @@ wss.on('connection', (ws) => {
                     if (!contacts[to].includes(from)) contacts[to].push(from);
                     writeContacts(contacts);
                     console.log(`📝 [${clientId}] Контакт сохранён: ${from} ↔ ${to}`);
-                    // Уведомить получателя, если он онлайн
                     const recipient = clients.get(to);
                     if (recipient) {
                         recipient.send(JSON.stringify({ type: 'create_chat', from, fromName: from, to }));
-                        console.log(`📨 [${clientId}] Уведомление отправлено ${to}`);
                     }
                 }
             }
 
-            // ---------- ПОЛУЧЕНИЕ КОНТАКТОВ ----------
+            // ========== ПОЛУЧЕНИЕ КОНТАКТОВ ==========
             if (msg.type === 'get_contacts') {
                 const contacts = readContacts();
                 const userContacts = contacts[userPhone] || [];
@@ -179,14 +187,14 @@ wss.on('connection', (ws) => {
                 console.log(`📋 [${clientId}] Отправлены контакты: ${userContacts.join(', ')}`);
             }
 
-            // ---------- ПОЛУЧЕНИЕ ИСТОРИИ СООБЩЕНИЙ ----------
+            // ========== ИСТОРИЯ СООБЩЕНИЙ ==========
             if (msg.type === 'get_messages') {
                 const allMessages = readMessages();
                 const userMessages = allMessages.filter(m => m.from === userPhone || m.to === userPhone);
                 ws.send(JSON.stringify({ type: 'messages_history', messages: userMessages }));
             }
 
-            // ---------- ОТПРАВКА СООБЩЕНИЯ ----------
+            // ========== ОТПРАВКА СООБЩЕНИЯ ==========
             if (msg.type === 'chat_message') {
                 const { from, fromName, to, content, encrypted, timestamp } = msg;
                 const allMessages = readMessages();
@@ -195,13 +203,13 @@ wss.on('connection', (ws) => {
                 const recipient = clients.get(to);
                 if (recipient) {
                     recipient.send(JSON.stringify({ type: 'chat_message', from, fromName, content, encrypted, timestamp }));
-                    console.log(`📤 [${clientId}] Сообщение доставлено ${to}`);
+                    console.log(`✅ [${clientId}] Сообщение доставлено ${to}`);
                 } else {
                     console.log(`❌ [${clientId}] Получатель оффлайн`);
                 }
             }
 
-            // ---------- ОБНОВЛЕНИЕ ПРОФИЛЯ ----------
+            // ========== ОБНОВЛЕНИЕ ПРОФИЛЯ ==========
             if (msg.type === 'update_profile') {
                 const { user } = msg;
                 if (user && user.phone) {
@@ -214,7 +222,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ПОЛУЧЕНИЕ ПРОФИЛЯ ----------
+            // ========== ПОЛУЧЕНИЕ ПРОФИЛЯ ==========
             if (msg.type === 'get_profile') {
                 const users = readUsers();
                 const user = users[msg.phone || userPhone];
@@ -232,13 +240,13 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ИНДИКАТОР НАБОРА ----------
+            // ========== ИНДИКАТОР НАБОРА ==========
             if (msg.type === 'typing') {
                 const recipient = clients.get(msg.to);
                 if (recipient) recipient.send(JSON.stringify({ type: 'typing', from: msg.from }));
             }
 
-            // ---------- WEBRTC ----------
+            // ========== WEBRTC СИГНАЛИНГ ==========
             if (['offer', 'answer', 'ice-candidate'].includes(msg.type)) {
                 const recipient = clients.get(msg.to);
                 if (recipient) {
