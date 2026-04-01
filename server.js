@@ -10,12 +10,12 @@ const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-function initFiles() {
+function init() {
     if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, '{}');
     if (!fs.existsSync(CONTACTS_FILE)) fs.writeFileSync(CONTACTS_FILE, '{}');
     if (!fs.existsSync(MESSAGES_FILE)) fs.writeFileSync(MESSAGES_FILE, '[]');
 }
-initFiles();
+init();
 
 function readUsers() { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); }
 function writeUsers(data) { fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2)); }
@@ -24,7 +24,7 @@ function writeContacts(data) { fs.writeFileSync(CONTACTS_FILE, JSON.stringify(da
 function readMessages() { return JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8')); }
 function writeMessages(data) { fs.writeFileSync(MESSAGES_FILE, JSON.stringify(data, null, 2)); }
 
-const clients = new Map();
+const clients = new Map(); // phone -> WebSocket
 
 const wss = new WebSocket.Server({ port: PORT, host: '0.0.0.0' });
 console.log(`🚀 Сервер запущен на порту ${PORT}`);
@@ -162,10 +162,11 @@ wss.on('connection', (ws) => {
                     if (!contacts[to].includes(from)) contacts[to].push(from);
                     writeContacts(contacts);
                     console.log(`📝 [${clientId}] Контакт сохранён: ${from} ↔ ${to}`);
+                    // Уведомить получателя, если он онлайн
                     const recipient = clients.get(to);
                     if (recipient) {
-                        recipient.send(JSON.stringify({ type: 'create_chat', from: from, fromName: from, to: to }));
-                        console.log(`📨 [${clientId}] Уведомление отправлено получателю ${to}`);
+                        recipient.send(JSON.stringify({ type: 'create_chat', from, fromName: from, to }));
+                        console.log(`📨 [${clientId}] Уведомление отправлено ${to}`);
                     }
                 }
             }
@@ -175,7 +176,7 @@ wss.on('connection', (ws) => {
                 const contacts = readContacts();
                 const userContacts = contacts[userPhone] || [];
                 ws.send(JSON.stringify({ type: 'contacts_list', contacts: userContacts }));
-                console.log(`📞 [${clientId}] Отправлены контакты: ${userContacts.join(', ')}`);
+                console.log(`📋 [${clientId}] Отправлены контакты: ${userContacts.join(', ')}`);
             }
 
             // ---------- ПОЛУЧЕНИЕ ИСТОРИИ СООБЩЕНИЙ ----------
@@ -183,7 +184,6 @@ wss.on('connection', (ws) => {
                 const allMessages = readMessages();
                 const userMessages = allMessages.filter(m => m.from === userPhone || m.to === userPhone);
                 ws.send(JSON.stringify({ type: 'messages_history', messages: userMessages }));
-                console.log(`💬 [${clientId}] Отправлено ${userMessages.length} сообщений`);
             }
 
             // ---------- ОТПРАВКА СООБЩЕНИЯ ----------
@@ -192,11 +192,10 @@ wss.on('connection', (ws) => {
                 const allMessages = readMessages();
                 allMessages.push({ from, fromName, to, content, encrypted, timestamp: timestamp || new Date().toISOString() });
                 writeMessages(allMessages);
-                console.log(`📤 [${clientId}] Сообщение от ${from} → ${to}`);
                 const recipient = clients.get(to);
                 if (recipient) {
                     recipient.send(JSON.stringify({ type: 'chat_message', from, fromName, content, encrypted, timestamp }));
-                    console.log(`✅ [${clientId}] Доставлено получателю`);
+                    console.log(`📤 [${clientId}] Сообщение доставлено ${to}`);
                 } else {
                     console.log(`❌ [${clientId}] Получатель оффлайн`);
                 }
