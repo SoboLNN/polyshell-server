@@ -183,6 +183,18 @@ wss.on('connection', (ws) => {
                 console.log(`✅ [${clientId}] Автовход по токену ${token} для ${phone}`);
             }
 
+            // ========== ОБНОВЛЕНИЕ КЛЮЧЕЙ (для старых пользователей) ==========
+            if (msg.type === 'update_keys') {
+                const { phone, publicKey, encryptedPrivateKey } = msg;
+                if (phone && publicKey && encryptedPrivateKey) {
+                    await pool.query('UPDATE users SET public_key = $1, encrypted_private_key = $2 WHERE phone = $3', [publicKey, encryptedPrivateKey, phone]);
+                    ws.send(JSON.stringify({ type: 'keys_updated', success: true }));
+                    console.log(`🔑 [${clientId}] Ключи обновлены для ${phone}`);
+                } else {
+                    ws.send(JSON.stringify({ type: 'update_keys_error', error: 'Недостаточно данных' }));
+                }
+            }
+
             // ========== ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ (для привязки сокета) ==========
             if (msg.type === 'user_info') {
                 const phone = msg.phone;
@@ -318,7 +330,7 @@ wss.on('connection', (ws) => {
                 if (recipient) recipient.send(JSON.stringify({ type: 'typing', from: msg.from }));
             }
 
-            // ========== WEBRTC ==========
+            // ========== WEBRTC СИГНАЛИНГ ==========
             if (['offer', 'answer', 'ice-candidate'].includes(msg.type)) {
                 const recipient = clients.get(msg.to);
                 if (recipient) {
