@@ -239,14 +239,20 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ========== СОЗДАНИЕ ЧАТА (добавление контакта) ==========
+            // ========== СОЗДАНИЕ ЧАТА (добавление контакта, включая чат с собой) ==========
             if (msg.type === 'create_chat') {
                 const from = userPhone;
                 const to = msg.to;
-                if (from && to && from !== to) {
-                    await pool.query('INSERT INTO contacts (user_phone, contact_phone) VALUES ($1, $2) ON CONFLICT DO NOTHING', [from, to]);
-                    await pool.query('INSERT INTO contacts (user_phone, contact_phone) VALUES ($1, $2) ON CONFLICT DO NOTHING', [to, from]);
-                    console.log(`📝 [${clientId}] Контакт сохранён: ${from} ↔ ${to}`);
+                if (from && to) {
+                    if (from !== to) {
+                        // Обычный контакт – сохраняем в таблицу contacts
+                        await pool.query('INSERT INTO contacts (user_phone, contact_phone) VALUES ($1, $2) ON CONFLICT DO NOTHING', [from, to]);
+                        await pool.query('INSERT INTO contacts (user_phone, contact_phone) VALUES ($1, $2) ON CONFLICT DO NOTHING', [to, from]);
+                        console.log(`📝 [${clientId}] Контакт сохранён: ${from} ↔ ${to}`);
+                    } else {
+                        // Чат с самим собой – не сохраняем в contacts, но разрешаем
+                        console.log(`📝 [${clientId}] Чат с самим собой: ${from}`);
+                    }
                     const recipient = clients.get(to);
                     if (recipient) {
                         recipient.send(JSON.stringify({ type: 'create_chat', from, fromName: from, to }));
