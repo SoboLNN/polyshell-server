@@ -1,6 +1,7 @@
 const WebSocket = require('ws');
 const { Pool } = require('pg');
 const crypto = require('crypto');
+const http = require('http');
 
 const PORT = process.env.PORT || 8080;
 const pool = new Pool({
@@ -53,7 +54,6 @@ async function initDatabase() {
             created_at TIMESTAMP DEFAULT NOW()
         )
     `);
-    // Миграция для старых таблиц (если колонок нет)
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_file BOOLEAN DEFAULT false`);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name TEXT`);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_size BIGINT`);
@@ -63,8 +63,22 @@ async function initDatabase() {
 initDatabase().catch(console.error);
 
 const clients = new Map(); // phone -> WebSocket
-const wss = new WebSocket.Server({ port: PORT, host: '0.0.0.0' });
-console.log(`🚀 Сервер запущен на порту ${PORT}`);
+const wss = new WebSocket.Server({ noServer: true });
+
+// HTTP сервер для пробуждения Render и апгрейда WebSocket
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('PolyShell Server OK');
+});
+
+server.on('upgrade', (request, socket, head) => {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+    });
+});
+
+server.listen(PORT, '0.0.0.0');
+console.log(`🚀 Сервер запущен на порту ${PORT} (HTTP + WS)`);
 
 function generateToken() {
     return crypto.randomBytes(32).toString('hex');
@@ -73,6 +87,9 @@ function generateToken() {
 wss.on('connection', (ws) => {
     const clientId = Math.random().toString(36).substr(2, 9);
     let userPhone = null;
+
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', async (data) => {
         try {
@@ -156,41 +173,41 @@ wss.on('connection', (ws) => {
 
             // ========== ВХОД ПО ТОКЕНУ ==========
             if (msg.type === 'login_with_token') {
-    const { token } = msg;
-    const session = await pool.query('SELECT phone FROM sessions WHERE token = $1', [token]);
-    if (session.rows.length === 0) {
-        ws.send(JSON.stringify({ type: 'login_error', error: 'Недействительный токен' }));
-        return;
-    }
-    const phone = session.rows[0].phone;
-    const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
-    if (user.rows.length === 0) {
-        ws.send(JSON.stringify({ type: 'login_error', error: 'Пользователь не найден' }));
-        return;
-    }
-    const userData = user.rows[0];
-    await pool.query('UPDATE users SET status = $1, last_seen = NOW() WHERE phone = $2', ['онлайн', phone]);
-    userPhone = phone;                   // <-- добавить
-    clients.set(userPhone, ws);          // <-- добавить
-    ws.phone = userPhone;                // <-- добавить
-    ws.id = clientId;                    // <-- добавить
-    ws.send(JSON.stringify({
-        type: 'login_success',
-        token,
-        user: {
-            phone: userData.phone,
-            name: userData.name,
-            avatar: userData.avatar,
-            status: 'онлайн',
-            email: userData.email,
-            publicKey: userData.public_key,
-            encryptedPrivateKey: userData.encrypted_private_key,
-            settings: userData.settings,
-            lastSeen: userData.last_seen
-        }
-    }));
-    console.log(`✅ [${clientId}] Автовход по токену ${token} для ${phone}`);
-}
+                const { token } = msg;
+                const session = await pool.query('SELECT phone FROM sessions WHERE token = $1', [token]);
+                if (session.rows.length === 0) {
+                    ws.send(JSON.stringify({ type: 'login_error', error: 'Недействительный токен' }));
+                    return;
+                }
+                const phone = session.rows[0].phone;
+                const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+                if (user.rows.length === 0) {
+                    ws.send(JSON.stringify({ type: 'login_error', error: 'Пользователь не найден' }));
+                    return;
+                }
+                const userData = user.rows[0];
+                await pool.query('UPDATE users SET status = $1, last_seen = NOW() WHERE phone = $2', ['онлайн', phone]);
+                userPhone = phone;
+                clients.set(userPhone, ws);
+                ws.phone = userPhone;
+                ws.id = clientId;
+                ws.send(JSON.stringify({
+                    type: 'login_success',
+                    token,
+                    user: {
+                        phone: userData.phone,
+                        name: userData.name,
+                        avatar: userData.avatar,
+                        status: 'онлайн',
+                        email: userData.email,
+                        publicKey: userData.public_key,
+                        encryptedPrivateKey: userData.encrypted_private_key,
+                        settings: userData.settings,
+                        lastSeen: userData.last_seen
+                    }
+                }));
+                console.log(`✅ [${clientId}] Автовход по токену ${token} для ${phone}`);
+            }
 
             // ========== ОБНОВЛЕНИЕ КЛЮЧЕЙ ==========
             if (msg.type === 'update_keys') {
@@ -277,7 +294,7 @@ wss.on('connection', (ws) => {
                 console.log(`📋 [${clientId}] Отправлены контакты: ${contacts.join(', ')}`);
             }
 
-            // ========== ИСТОРИЯ СООБЩЕНИЙ (С ПОДДЕРЖКОЙ ФАЙЛОВ) ==========
+            // ========== ИСТОРИЯ СООБЩЕНИЙ ==========
             if (msg.type === 'get_messages') {
                 const result = await pool.query(
                     `SELECT from_phone, to_phone, content, encrypted, timestamp, is_file, file_name, file_size, file_type
@@ -289,7 +306,7 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'messages_history', messages: result.rows }));
             }
 
-            // ========== ОТПРАВКА СООБЩЕНИЯ (С ФАЙЛАМИ) ==========
+            // ========== ОТПРАВКА СООБЩЕНИЯ ==========
             if (msg.type === 'chat_message') {
                 const { from, fromName, to, content, encrypted, timestamp, isFile, fileName, fileSize, fileType } = msg;
                 await pool.query(
@@ -402,10 +419,13 @@ wss.on('connection', (ws) => {
     ws.on('error', (err) => console.error(`⚠️ [${clientId}] Ошибка сокета:`, err.message));
 });
 
-setInterval(() => {
+// Проверка живых соединений (пинг-понг)
+const interval = setInterval(() => {
     wss.clients.forEach(ws => {
         if (ws.isAlive === false) return ws.terminate();
         ws.isAlive = false;
         ws.ping();
     });
 }, 30000);
+
+wss.on('close', () => clearInterval(interval));
