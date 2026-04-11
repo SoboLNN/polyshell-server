@@ -10,6 +10,10 @@ const pool = new Pool({
 });
 
 async function initDatabase() {
+    // Удаляем старую таблицу messages для изменения типа id (временно, для миграции)
+    await pool.query(`DROP TABLE IF EXISTS messages CASCADE`);
+    console.log('🔄 Старая таблица messages удалена');
+
     await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
             phone VARCHAR(20) PRIMARY KEY,
@@ -34,7 +38,7 @@ async function initDatabase() {
         )
     `);
     await pool.query(`
-        CREATE TABLE IF NOT EXISTS messages (
+        CREATE TABLE messages (
             id TEXT PRIMARY KEY,
             from_phone VARCHAR(20) NOT NULL,
             to_phone VARCHAR(20) NOT NULL,
@@ -55,7 +59,7 @@ async function initDatabase() {
             created_at TIMESTAMP DEFAULT NOW()
         )
     `);
-    // Добавляем недостающие колонки для совместимости
+    // Добавляем недостающие колонки для совместимости (если вдруг что-то не так)
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_file BOOLEAN DEFAULT false`);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name TEXT`);
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_size BIGINT`);
