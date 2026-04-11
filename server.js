@@ -156,41 +156,41 @@ wss.on('connection', (ws) => {
 
             // ========== ВХОД ПО ТОКЕНУ ==========
             if (msg.type === 'login_with_token') {
-                const { token } = msg;
-                const session = await pool.query('SELECT phone FROM sessions WHERE token = $1', [token]);
-                if (session.rows.length === 0) {
-                    ws.send(JSON.stringify({ type: 'login_error', error: 'Недействительный токен' }));
-                    return;
-                }
-                const phone = session.rows[0].phone;
-                const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
-                if (user.rows.length === 0) {
-                    ws.send(JSON.stringify({ type: 'login_error', error: 'Пользователь не найден' }));
-                    return;
-                }
-                const userData = user.rows[0];
-                await pool.query('UPDATE users SET status = $1, last_seen = NOW() WHERE phone = $2', ['онлайн', phone]);
-                userPhone = phone;
-                clients.set(userPhone, ws);
-                ws.phone = userPhone;
-                ws.id = clientId;
-                ws.send(JSON.stringify({
-                    type: 'login_success',
-                    token,
-                    user: {
-                        phone: userData.phone,
-                        name: userData.name,
-                        avatar: userData.avatar,
-                        status: 'онлайн',
-                        email: userData.email,
-                        publicKey: userData.public_key,
-                        encryptedPrivateKey: userData.encrypted_private_key,
-                        settings: userData.settings,
-                        lastSeen: userData.last_seen
-                    }
-                }));
-                console.log(`✅ [${clientId}] Автовход по токену ${token} для ${phone}`);
-            }
+    const { token } = msg;
+    const session = await pool.query('SELECT phone FROM sessions WHERE token = $1', [token]);
+    if (session.rows.length === 0) {
+        ws.send(JSON.stringify({ type: 'login_error', error: 'Недействительный токен' }));
+        return;
+    }
+    const phone = session.rows[0].phone;
+    const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+    if (user.rows.length === 0) {
+        ws.send(JSON.stringify({ type: 'login_error', error: 'Пользователь не найден' }));
+        return;
+    }
+    const userData = user.rows[0];
+    await pool.query('UPDATE users SET status = $1, last_seen = NOW() WHERE phone = $2', ['онлайн', phone]);
+    userPhone = phone;                   // <-- добавить
+    clients.set(userPhone, ws);          // <-- добавить
+    ws.phone = userPhone;                // <-- добавить
+    ws.id = clientId;                    // <-- добавить
+    ws.send(JSON.stringify({
+        type: 'login_success',
+        token,
+        user: {
+            phone: userData.phone,
+            name: userData.name,
+            avatar: userData.avatar,
+            status: 'онлайн',
+            email: userData.email,
+            publicKey: userData.public_key,
+            encryptedPrivateKey: userData.encrypted_private_key,
+            settings: userData.settings,
+            lastSeen: userData.last_seen
+        }
+    }));
+    console.log(`✅ [${clientId}] Автовход по токену ${token} для ${phone}`);
+}
 
             // ========== ОБНОВЛЕНИЕ КЛЮЧЕЙ ==========
             if (msg.type === 'update_keys') {
