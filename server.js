@@ -8,11 +8,11 @@ const { GoogleAuth } = require('google-auth-library');
 // ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
 const PORT = process.env.PORT || 8080;
 const DATABASE_URL = process.env.DATABASE_URL;
-const FCM_PROJECT_ID = couz-a31a1;
-const FCM_CLIENT_EMAIL = firebase-adminsdk-fbsvc@couz-a31a1.iam.gserviceaccount.com;
-const FCM_PRIVATE_KEY = -----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDAuqogczoWnvLR\n6snwvA12r3Oyr0q3dhMpkerkdiizOqeMt/OciRnstaSXjvivfhOGf6kjiq5C5eH+\niIOSZhzV3TQ6ADJqxCB8H4ptZXa5x3H4jF3nETwpe5FJC/QennhiEmvUBpbplc1l\n3yz4MbIfweLhF+qt6/LYcZfI+mo6aJzV1YDsHjtC5yq44DeLjoL5RDPid3724Z5/\njVeygl+01xBgWesXlR3olrWkEdO+5Dz1CxMZlnAxsn1E194+WHEZJA8HFJs5V78a\ny29WIz6V2bJjgreTeb9UHJ3etVss3DWgXzFZPNixn/blBjRxAeaS6uhbXyToVF8d\nYsE2LwjpAgMBAAECggEAPYPXBWCB6/Jz4pikOBht27IIpcHZgVFIsH4IkT89omdY\nT0vvj8ka4zje/hj+O1VsegOJQvTixiuFxK5iAHpjPcfLAbBKZ1WOYM/YaS53hLiq\nIgD7f+M6ZqswJjaQhq1iEzt5+0TXKltMIfXn7pg+GHDUL7BokXa8HmWzYsy610U5\ntMIiZxeJp+emZot157fDX1Vxwr66Fe7TIvpWi9YkqEbg+Pv7WAL3dn988g7dtcAi\nkGFjFvSMLe4pAsMNDHKHN+JaXOeTfyqed0Sy6pIuvxVHsfIXjUMSD8KNnaagXs57\nUAA+SfhjQe7MaIEFHP+FQOCXp7yIQZjx2KIevZ7cuQKBgQD9SsYJJBvuSLgymsOc\nNXkXyB6SDeN+h+BpKy3jGy8ycjY/huhqJjgvQDaq5sbB9KDADu5gmFRlRZOuNbc9\nZRui2d8A9BniNtyk+ZY0/SaZILt5yns1FAJwHW+381Gfb4zC4LluRyHxzkHRT1nG\nQy2oaDJEfNUBrvzSA2Muf3HoPwKBgQDCyiNtMUI/qzsOj2pQcrmq142LzJfCyywT\n/rYh9MrWJKZuHN1RmvUC6AbnvlkY7gBSCL86WG+BlCXF6wYZG59/xTXmpss7us/q\n8LrqnKzvQ2Gk9v9Q9x/KJiVtnWeG5s/mS+EEIHCnEuzKtjv9aloNjTd4kPif7iju\nIbV3QRwE1wKBgDoYxIOkPKPTGizBQsy5lyTVSe3GMb/7+oUk2kmVGqY/fCHmF7kB\nOzHbUK6ycDRcn+Jtik+toO35n3395CG45zXbM0NMugMhAkr01Hci+Y916ops3wW1\nqTl+BvnyXW5sb6TjVqTsu+RyorYXtUe8cOSHwb/jwhe4w1SIYl9v6/iRAoGAUQmJ\nfYbtudFB64fMwhVImwO8NnnydS7TcqoYGb5emIJ83viRNr8RyZjALq9pH878QSS0\ncdCS60S4BkQFsHJmg+CG0SN5D6tjjqmCCdMOuye8OsYraAK3rgD6t0Sx6lSiD3xn\n67CXTVq5OohgIsiZGGQ0vKsLVHXff1p0xV1IC9cCgYEAgLCq2n1Re0/gPXKL1rdw\nZHxo0MuNSfcSdCVUxaQmJwrehAau1DCLB8sFgAlHJG9x4omPpw6vl+CUzjxZTUgi\nx7/kVbTYXitSHxSb9bwWzMxaqd8lAg6AtcNAGC6aMuPplfDfes5I7uqkyjmWmvuO\nkPp7+z4cmu/ld0QaVpUTXbc=\n-----END PRIVATE KEY-----\n;
+const FCM_PROJECT_ID = process.env.FCM_PROJECT_ID;
+const FCM_CLIENT_EMAIL = process.env.FCM_CLIENT_EMAIL;   // ← должно быть так
+const FCM_PRIVATE_KEY = process.env.FCM_PRIVATE_KEY;
 
-// Инициализация GoogleAuth для FCM v1 (если ключи предоставлены)
+// Инициализация GoogleAuth
 let googleAuth = null;
 if (FCM_CLIENT_EMAIL && FCM_PRIVATE_KEY) {
     googleAuth = new GoogleAuth({
