@@ -10,8 +10,6 @@ const pool = new Pool({
 });
 
 async function initDatabase() {
-    // При необходимости можно удалить старую таблицу messages (осторожно на продакшене)
-    // await pool.query(`DROP TABLE IF EXISTS messages CASCADE`);
     await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
             phone VARCHAR(20) PRIMARY KEY,
@@ -45,9 +43,14 @@ async function initDatabase() {
             file_name TEXT,
             file_size BIGINT,
             file_type TEXT,
+            delivered BOOLEAN DEFAULT false,
+            read BOOLEAN DEFAULT false,
             timestamp TIMESTAMP DEFAULT NOW()
         )
     `);
+    // Добавляем столбцы, если таблица уже существовала
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered BOOLEAN DEFAULT false`);
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read BOOLEAN DEFAULT false`);
     await pool.query(`
         CREATE TABLE IF NOT EXISTS sessions (
             token VARCHAR(64) PRIMARY KEY,
@@ -55,11 +58,11 @@ async function initDatabase() {
             created_at TIMESTAMP DEFAULT NOW()
         )
     `);
-    console.log('✅ База данных инициализирована (без шифрования)');
+    console.log('✅ База данных инициализирована');
 }
 initDatabase().catch(console.error);
 
-const clients = new Map(); // phone -> WebSocket
+const clients = new Map();
 const wss = new WebSocket.Server({ noServer: true });
 
 const server = http.createServer((req, res) => {
@@ -90,7 +93,7 @@ wss.on('connection', (ws) => {
             const msg = JSON.parse(data);
             console.log(`\n📨 [${clientId}] ${msg.type}`);
 
-            // ========== РЕГИСТРАЦИЯ ==========
+            // --- РЕГИСТРАЦИЯ ---
             if (msg.type === 'register') {
                 const { phone, name, password, avatar, email } = msg;
                 const existing = await pool.query('SELECT phone FROM users WHERE phone = $1', [phone]);
@@ -115,7 +118,7 @@ wss.on('connection', (ws) => {
                 console.log(`✅ [${clientId}] Зарегистрирован ${phone}`);
             }
 
-            // ========== ВХОД ПО ПАРОЛЮ ==========
+            // --- ВХОД ПО ПАРОЛЮ ---
             if (msg.type === 'login') {
                 const { phone, password } = msg;
                 const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
@@ -145,7 +148,7 @@ wss.on('connection', (ws) => {
                 console.log(`✅ [${clientId}] Вход ${phone}, выдан токен ${token}`);
             }
 
-            // ========== ВХОД ПО ТОКЕНУ ==========
+            // --- ВХОД ПО ТОКЕНУ ---
             if (msg.type === 'login_with_token') {
                 const { token } = msg;
                 const session = await pool.query('SELECT phone FROM sessions WHERE token = $1', [token]);
@@ -175,7 +178,7 @@ wss.on('connection', (ws) => {
                 console.log(`✅ [${clientId}] Автовход по токену ${token} для ${phone}`);
             }
 
-            // ========== ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ ==========
+            // --- ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ ---
             if (msg.type === 'user_info') {
                 const phone = msg.phone;
                 if (phone) {
@@ -190,7 +193,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ========== ПОИСК ПОЛЬЗОВАТЕЛЯ ==========
+            // --- ПОИСК ПОЛЬЗОВАТЕЛЯ ---
             if (msg.type === 'find_user') {
                 const result = await pool.query('SELECT phone, name, avatar, status, last_seen FROM users WHERE phone = $1', [msg.phone]);
                 if (result.rows.length > 0) {
@@ -200,7 +203,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ========== СОЗДАНИЕ ЧАТА (ДОБАВЛЕНИЕ В КОНТАКТЫ) ==========
+            // --- СОЗДАНИЕ ЧАТА ---
             if (msg.type === 'create_chat') {
                 const from = userPhone;
                 const to = msg.to;
@@ -208,9 +211,7 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не указан отправитель или получатель' }));
                     return;
                 }
-                if (from === to) {
-                    console.log(`📝 [${clientId}] Чат с самим собой: ${from}`);
-                } else {
+                if (from !== to) {
                     const recipientExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [to]);
                     if (recipientExists.rows.length === 0) {
                         ws.send(JSON.stringify({ type: 'error', error: 'Пользователь не найден' }));
@@ -218,7 +219,6 @@ wss.on('connection', (ws) => {
                     }
                     await pool.query('INSERT INTO contacts (user_phone, contact_phone) VALUES ($1, $2) ON CONFLICT DO NOTHING', [from, to]);
                     await pool.query('INSERT INTO contacts (user_phone, contact_phone) VALUES ($1, $2) ON CONFLICT DO NOTHING', [to, from]);
-                    console.log(`📝 [${clientId}] Контакт сохранён: ${from} ↔ ${to}`);
                 }
                 const recipient = clients.get(to);
                 if (recipient) {
@@ -227,7 +227,7 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'chat_created', success: true }));
             }
 
-            // ========== ПОЛУЧЕНИЕ КОНТАКТОВ ==========
+            // --- ПОЛУЧЕНИЕ КОНТАКТОВ ---
             if (msg.type === 'get_contacts') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -237,14 +237,14 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'contacts_list', contacts: result.rows.map(r => r.contact_phone) }));
             }
 
-            // ========== ПОЛУЧЕНИЕ ИСТОРИИ СООБЩЕНИЙ ==========
+            // --- ПОЛУЧЕНИЕ ИСТОРИИ ---
             if (msg.type === 'get_messages') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
                     return;
                 }
                 const result = await pool.query(
-                    `SELECT id, from_phone, to_phone, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp
+                    `SELECT id, from_phone, to_phone, content, encrypted, is_file, is_voice, file_name, file_size, file_type, delivered, read, timestamp
                      FROM messages
                      WHERE from_phone = $1 OR to_phone = $1
                      ORDER BY timestamp ASC`,
@@ -253,11 +253,15 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'messages_history', messages: result.rows }));
             }
 
-            // ========== ОТПРАВКА СООБЩЕНИЯ ==========
+            // --- ОТПРАВКА СООБЩЕНИЯ ---
             if (msg.type === 'chat_message') {
                 const { id, from, fromName, to, content, timestamp, isFile, isVoice, fileName, fileSize, fileType } = msg;
                 if (!from || !to) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Отправитель или получатель не указан' }));
+                    return;
+                }
+                if (from !== userPhone) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Нельзя отправить сообщение от чужого имени' }));
                     return;
                 }
                 const recipientExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [to]);
@@ -265,13 +269,9 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Получатель не найден' }));
                     return;
                 }
-                if (from !== userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Нельзя отправить сообщение от чужого имени' }));
-                    return;
-                }
                 await pool.query(
-                    `INSERT INTO messages (id, from_phone, to_phone, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+                    `INSERT INTO messages (id, from_phone, to_phone, content, encrypted, is_file, is_voice, file_name, file_size, file_type, delivered, read, timestamp)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false, false, $11)`,
                     [id, from, to, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString()]
                 );
                 const recipientWs = clients.get(to);
@@ -283,11 +283,12 @@ wss.on('connection', (ws) => {
                         fileName, fileSize, fileType
                     }));
                 }
+                // Отправляем подтверждение доставки (для отправителя)
                 ws.send(JSON.stringify({ type: 'message_delivered', messageId: id, to }));
                 console.log(`✅ Сообщение ${id} от ${from} к ${to}`);
             }
 
-            // ========== ПОДТВЕРЖДЕНИЕ ПРОЧТЕНИЯ ==========
+            // --- ПОДТВЕРЖДЕНИЕ ПРОЧТЕНИЯ ---
             if (msg.type === 'read_receipt') {
                 const { messageIds, from, to } = msg;
                 if (!from || !to || !messageIds) return;
@@ -295,13 +296,15 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
                     return;
                 }
+                // Обновляем статус прочтения в БД
+                await pool.query('UPDATE messages SET read = true WHERE id = ANY($1::text[]) AND to_phone = $2', [messageIds, to]);
                 const sender = clients.get(to);
                 if (sender) {
                     sender.send(JSON.stringify({ type: 'message_read', messageIds, from }));
                 }
             }
 
-            // ========== ОБНОВЛЕНИЕ ПРОФИЛЯ ==========
+            // --- ОБНОВЛЕНИЕ ПРОФИЛЯ ---
             if (msg.type === 'update_profile') {
                 const { user } = msg;
                 if (!user || !user.phone) return;
@@ -323,7 +326,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ========== ПОЛУЧЕНИЕ ПРОФИЛЯ ==========
+            // --- ПОЛУЧЕНИЕ ПРОФИЛЯ ---
             if (msg.type === 'get_profile') {
                 const phone = msg.phone || userPhone;
                 if (!phone) return;
@@ -335,19 +338,19 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ========== ИНДИКАТОР НАБОРА ==========
+            // --- ИНДИКАТОР НАБОРА ---
             if (msg.type === 'typing') {
                 const recipient = clients.get(msg.to);
                 if (recipient) recipient.send(JSON.stringify({ type: 'typing', from: msg.from }));
             }
 
-            // ========== WEBRTC СИГНАЛИНГ ==========
+            // --- WEBRTC ---
             if (['offer', 'answer', 'ice-candidate', 'call_ended'].includes(msg.type)) {
                 const recipient = clients.get(msg.to);
                 if (recipient) recipient.send(JSON.stringify(msg));
             }
 
-            // ========== СМЕНА ПАРОЛЯ ==========
+            // --- СМЕНА ПАРОЛЯ ---
             if (msg.type === 'change_password') {
                 if (!userPhone || msg.phone !== userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
@@ -357,7 +360,7 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'password_changed' }));
             }
 
-            // ========== ВЫХОД ==========
+            // --- ВЫХОД ---
             if (msg.type === 'logout') {
                 if (msg.token) await pool.query('DELETE FROM sessions WHERE token = $1', [msg.token]);
                 ws.send(JSON.stringify({ type: 'logout_success' }));
