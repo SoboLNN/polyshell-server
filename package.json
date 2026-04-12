@@ -1,16 +1,22 @@
 {
   "name": "polyshell-server",
   "version": "1.0.0",
-  "description": "PolyShell signaling server with PostgreSQL storage",
+  "description": "WebSocket signaling server with PostgreSQL and push notifications",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "ws": "^8.14.2",
-    "pg": "^8.11.3"
+    "pg": "^8.11.3",
+    "crypto": "^1.0.1",
+    "http": "^0.0.1-security",
+    "web-push": "^3.6.6",
+    "axios": "^1.5.0",
+    "google-auth-library": "^9.0.0"
   },
   "engines": {
-    "node": ">=16"
+    "node": ">=18"
   }
 }

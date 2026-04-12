@@ -2,14 +2,44 @@ const WebSocket = require('ws');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const http = require('http');
+const webpush = require('web-push');
+const axios = require('axios');
+const { GoogleAuth } = require('google-auth-library');
 
+// ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
 const PORT = process.env.PORT || 8080;
+const DATABASE_URL = process.env.DATABASE_URL;
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@example.com';
+const FCM_PROJECT_ID = couz-a31a1; // ID проекта Firebase
+const FCM_CLIENT_EMAIL = firebase-adminsdk-fbsvc@couz-a31a1.iam.gserviceaccount.com; // email сервисного аккаунта
+const FCM_PRIVATE_KEY = -----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDAuqogczoWnvLR\n6snwvA12r3Oyr0q3dhMpkerkdiizOqeMt/OciRnstaSXjvivfhOGf6kjiq5C5eH+\niIOSZhzV3TQ6ADJqxCB8H4ptZXa5x3H4jF3nETwpe5FJC/QennhiEmvUBpbplc1l\n3yz4MbIfweLhF+qt6/LYcZfI+mo6aJzV1YDsHjtC5yq44DeLjoL5RDPid3724Z5/\njVeygl+01xBgWesXlR3olrWkEdO+5Dz1CxMZlnAxsn1E194+WHEZJA8HFJs5V78a\ny29WIz6V2bJjgreTeb9UHJ3etVss3DWgXzFZPNixn/blBjRxAeaS6uhbXyToVF8d\nYsE2LwjpAgMBAAECggEAPYPXBWCB6/Jz4pikOBht27IIpcHZgVFIsH4IkT89omdY\nT0vvj8ka4zje/hj+O1VsegOJQvTixiuFxK5iAHpjPcfLAbBKZ1WOYM/YaS53hLiq\nIgD7f+M6ZqswJjaQhq1iEzt5+0TXKltMIfXn7pg+GHDUL7BokXa8HmWzYsy610U5\ntMIiZxeJp+emZot157fDX1Vxwr66Fe7TIvpWi9YkqEbg+Pv7WAL3dn988g7dtcAi\nkGFjFvSMLe4pAsMNDHKHN+JaXOeTfyqed0Sy6pIuvxVHsfIXjUMSD8KNnaagXs57\nUAA+SfhjQe7MaIEFHP+FQOCXp7yIQZjx2KIevZ7cuQKBgQD9SsYJJBvuSLgymsOc\nNXkXyB6SDeN+h+BpKy3jGy8ycjY/huhqJjgvQDaq5sbB9KDADu5gmFRlRZOuNbc9\nZRui2d8A9BniNtyk+ZY0/SaZILt5yns1FAJwHW+381Gfb4zC4LluRyHxzkHRT1nG\nQy2oaDJEfNUBrvzSA2Muf3HoPwKBgQDCyiNtMUI/qzsOj2pQcrmq142LzJfCyywT\n/rYh9MrWJKZuHN1RmvUC6AbnvlkY7gBSCL86WG+BlCXF6wYZG59/xTXmpss7us/q\n8LrqnKzvQ2Gk9v9Q9x/KJiVtnWeG5s/mS+EEIHCnEuzKtjv9aloNjTd4kPif7iju\nIbV3QRwE1wKBgDoYxIOkPKPTGizBQsy5lyTVSe3GMb/7+oUk2kmVGqY/fCHmF7kB\nOzHbUK6ycDRcn+Jtik+toO35n3395CG45zXbM0NMugMhAkr01Hci+Y916ops3wW1\nqTl+BvnyXW5sb6TjVqTsu+RyorYXtUe8cOSHwb/jwhe4w1SIYl9v6/iRAoGAUQmJ\nfYbtudFB64fMwhVImwO8NnnydS7TcqoYGb5emIJ83viRNr8RyZjALq9pH878QSS0\ncdCS60S4BkQFsHJmg+CG0SN5D6tjjqmCCdMOuye8OsYraAK3rgD6t0Sx6lSiD3xn\n67CXTVq5OohgIsiZGGQ0vKsLVHXff1p0xV1IC9cCgYEAgLCq2n1Re0/gPXKL1rdw\nZHxo0MuNSfcSdCVUxaQmJwrehAau1DCLB8sFgAlHJG9x4omPpw6vl+CUzjxZTUgi\nx7/kVbTYXitSHxSb9bwWzMxaqd8lAg6AtcNAGC6aMuPplfDfes5I7uqkyjmWmvuO\nkPp7+z4cmu/ld0QaVpUTXbc=\n-----END PRIVATE KEY-----\n; // приватный ключ
+
+// Настройка web-push
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+}
+
+// Инициализация GoogleAuth для FCM v1
+let googleAuth = null;
+if (FCM_CLIENT_EMAIL && FCM_PRIVATE_KEY) {
+    googleAuth = new GoogleAuth({
+        credentials: {
+            client_email: FCM_CLIENT_EMAIL,
+            private_key: FCM_PRIVATE_KEY,
+        },
+        scopes: ['https://www.googleapis.com/auth/firebase.messaging'],
+    });
+}
+
+// ========== ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ==========
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false } // для Render.com
 });
 
-// ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ==========
+// ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ ==========
 async function initDatabase() {
     // Пользователи
     await pool.query(`
@@ -54,7 +84,7 @@ async function initDatabase() {
             PRIMARY KEY (group_id, user_phone)
         )
     `);
-    // Сообщения (базовая таблица)
+    // Сообщения
     await pool.query(`
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
@@ -73,17 +103,12 @@ async function initDatabase() {
         )
     `);
 
-    // ========== МИГРАЦИИ ==========
-    // Функция для безопасного добавления колонки
+    // Миграции
     const addColumnIfNotExists = async (table, column, definition) => {
         try {
             await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
-        } catch (err) {
-            console.error(`⚠️ Не удалось добавить колонку ${column}:`, err.message);
-        }
+        } catch (e) {}
     };
-
-    // Добавляем недостающие колонки в messages
     await addColumnIfNotExists('messages', 'group_id', 'TEXT REFERENCES groups(id) ON DELETE CASCADE');
     await addColumnIfNotExists('messages', 'encrypted', 'BOOLEAN DEFAULT false');
     await addColumnIfNotExists('messages', 'is_file', 'BOOLEAN DEFAULT false');
@@ -93,35 +118,25 @@ async function initDatabase() {
     await addColumnIfNotExists('messages', 'file_type', 'TEXT');
     await addColumnIfNotExists('messages', 'delivered', 'BOOLEAN DEFAULT false');
     await addColumnIfNotExists('messages', 'read', 'BOOLEAN DEFAULT false');
+    await addColumnIfNotExists('users', 'push_subscription', 'JSONB');
+    await addColumnIfNotExists('users', 'fcm_token', 'TEXT');
 
-    // Снимаем ограничение NOT NULL с to_phone (т.к. для групповых сообщений оно NULL)
     try {
         await pool.query(`ALTER TABLE messages ALTER COLUMN to_phone DROP NOT NULL`);
-        console.log('✅ Ограничение NOT NULL снято с to_phone');
-    } catch (err) {
-        console.log('⚠️ to_phone уже может быть NULL');
-    }
-
-    // Добавляем или обновляем CHECK constraint
+    } catch (e) {}
     try {
         await pool.query(`ALTER TABLE messages DROP CONSTRAINT IF EXISTS target_check`);
-        await pool.query(`ALTER TABLE messages ADD CONSTRAINT target_check CHECK (
-            (to_phone IS NOT NULL AND group_id IS NULL) OR 
-            (to_phone IS NULL AND group_id IS NOT NULL)
-        )`);
-        console.log('✅ Добавлен CHECK constraint для to_phone/group_id');
-    } catch (err) {
-        console.log('⚠️ CHECK constraint уже существует или не удалось добавить');
-    }
+        await pool.query(`ALTER TABLE messages ADD CONSTRAINT target_check CHECK ((to_phone IS NOT NULL AND group_id IS NULL) OR (to_phone IS NULL AND group_id IS NOT NULL))`);
+    } catch (e) {}
 
-    console.log('✅ База данных готова (с группами и миграциями)');
+    console.log('✅ База данных инициализирована');
 }
 initDatabase().catch(console.error);
 
 // ========== ХРАНИЛИЩЕ ПОДКЛЮЧЕНИЙ ==========
 const clients = new Map(); // phone -> WebSocket
 
-// ========== HTTP И WEBSOCKET СЕРВЕР ==========
+// ========== HTTP + WEBSOCKET СЕРВЕР ==========
 const wss = new WebSocket.Server({ noServer: true });
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -133,7 +148,7 @@ server.on('upgrade', (request, socket, head) => {
     });
 });
 server.listen(PORT, '0.0.0.0');
-console.log(`🚀 Сервер запущен на порту ${PORT} (HTTP + WS)`);
+console.log(`🚀 Сервер запущен на порту ${PORT}`);
 
 // ========== УТИЛИТЫ ==========
 function generateToken() {
@@ -141,6 +156,55 @@ function generateToken() {
 }
 function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+}
+
+// Отправка push-уведомления (Web Push или FCM v1)
+async function sendPushNotification(phone, title, body, data = {}) {
+    if (!phone) return;
+    const userRes = await pool.query('SELECT push_subscription, fcm_token FROM users WHERE phone = $1', [phone]);
+    const row = userRes.rows[0];
+    if (!row) return;
+
+    // Web Push
+    if (row.push_subscription) {
+        try {
+            await webpush.sendNotification(row.push_subscription, JSON.stringify({ title, body, ...data }));
+            console.log(`🌐 Web Push отправлен на ${phone}`);
+        } catch (err) {
+            if (err.statusCode === 410) {
+                await pool.query('UPDATE users SET push_subscription = NULL WHERE phone = $1', [phone]);
+            }
+            console.error(`❌ Web Push ошибка для ${phone}:`, err.message);
+        }
+    }
+
+    // FCM v1
+    if (row.fcm_token && googleAuth) {
+        try {
+            const authClient = await googleAuth.getClient();
+            const accessToken = await authClient.getAccessToken();
+            const fcmUrl = `https://fcm.googleapis.com/v1/projects/${FCM_PROJECT_ID}/messages:send`;
+            const payload = {
+                message: {
+                    token: row.fcm_token,
+                    notification: { title, body },
+                    data: data
+                }
+            };
+            await axios.post(fcmUrl, payload, {
+                headers: {
+                    'Authorization': `Bearer ${accessToken.token}`,
+                    'Content-Type': 'application/json'
+                }
+            });
+            console.log(`📱 FCM отправлен на ${phone}`);
+        } catch (err) {
+            console.error(`❌ FCM ошибка для ${phone}:`, err.response?.data || err.message);
+            if (err.response?.status === 404 || err.code === 'messaging/registration-token-not-registered') {
+                await pool.query('UPDATE users SET fcm_token = NULL WHERE phone = $1', [phone]);
+            }
+        }
+    }
 }
 
 // ========== ОБРАБОТКА ПОДКЛЮЧЕНИЙ ==========
@@ -154,7 +218,7 @@ wss.on('connection', (ws) => {
     ws.on('message', async (data) => {
         try {
             const msg = JSON.parse(data);
-            console.log(`\n📨 [${clientId}] ${msg.type}`);
+            console.log(`📨 [${clientId}] ${msg.type}`);
 
             // ========== РЕГИСТРАЦИЯ ==========
             if (msg.type === 'register') {
@@ -178,10 +242,10 @@ wss.on('connection', (ws) => {
                 clients.set(userPhone, ws);
                 ws.phone = userPhone;
                 await pool.query('UPDATE users SET status = $1, last_seen = NOW() WHERE phone = $2', ['онлайн', phone]);
-                console.log(`✅ [${clientId}] Зарегистрирован ${phone}`);
+                console.log(`✅ Зарегистрирован ${phone}`);
             }
 
-            // ========== ВХОД ПО ПАРОЛЮ ==========
+            // ========== ВХОД ==========
             else if (msg.type === 'login') {
                 const { phone, password } = msg;
                 const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
@@ -208,7 +272,7 @@ wss.on('connection', (ws) => {
                         status: 'онлайн', email: userData.email, settings: userData.settings
                     }
                 }));
-                console.log(`✅ [${clientId}] Вход ${phone}, выдан токен ${token}`);
+                console.log(`✅ Вход ${phone}`);
             }
 
             // ========== ВХОД ПО ТОКЕНУ ==========
@@ -238,21 +302,19 @@ wss.on('connection', (ws) => {
                         status: 'онлайн', email: userData.email, settings: userData.settings
                     }
                 }));
-                console.log(`✅ [${clientId}] Автовход по токену ${token} для ${phone}`);
+                console.log(`✅ Автовход ${phone}`);
             }
 
-            // ========== ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ ==========
-            else if (msg.type === 'user_info') {
-                const phone = msg.phone;
-                if (phone) {
-                    const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
-                    if (user.rows.length > 0) {
-                        userPhone = phone;
-                        clients.set(userPhone, ws);
-                        ws.phone = userPhone;
-                        await pool.query('UPDATE users SET status = $1, last_seen = NOW() WHERE phone = $2', ['онлайн', phone]);
-                        ws.send(JSON.stringify({ type: 'user_info_ack', success: true }));
-                    }
+            // ========== PUSH ПОДПИСКА ==========
+            else if (msg.type === 'push_subscribe') {
+                if (!userPhone) return;
+                const { subscription, token, platform } = msg;
+                if (platform === 'web' && subscription) {
+                    await pool.query('UPDATE users SET push_subscription = $1 WHERE phone = $2', [subscription, userPhone]);
+                    console.log(`🌐 Web Push подписка для ${userPhone}`);
+                } else if (platform === 'android' && token) {
+                    await pool.query('UPDATE users SET fcm_token = $1 WHERE phone = $2', [token, userPhone]);
+                    console.log(`📱 FCM токен сохранён для ${userPhone}`);
                 }
             }
 
@@ -266,27 +328,14 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ========== СОЗДАНИЕ ЛИЧНОГО ЧАТА (КОНТАКТ) ==========
+            // ========== СОЗДАНИЕ ЧАТА ==========
             else if (msg.type === 'create_chat') {
                 const from = userPhone;
                 const to = msg.to;
-                if (!from || !to) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан отправитель или получатель' }));
-                    return;
-                }
+                if (!from || !to) return;
                 if (from !== to) {
-                    const recipientExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [to]);
-                    if (recipientExists.rows.length === 0) {
-                        ws.send(JSON.stringify({ type: 'error', error: 'Пользователь не найден' }));
-                        return;
-                    }
                     await pool.query('INSERT INTO contacts (user_phone, contact_phone) VALUES ($1, $2) ON CONFLICT DO NOTHING', [from, to]);
                     await pool.query('INSERT INTO contacts (user_phone, contact_phone) VALUES ($1, $2) ON CONFLICT DO NOTHING', [to, from]);
-                    console.log(`📝 [${clientId}] Контакт сохранён: ${from} ↔ ${to}`);
-                }
-                const recipient = clients.get(to);
-                if (recipient) {
-                    recipient.send(JSON.stringify({ type: 'create_chat', from, fromName: from, to }));
                 }
                 ws.send(JSON.stringify({ type: 'chat_created', success: true }));
             }
@@ -294,34 +343,26 @@ wss.on('connection', (ws) => {
             // ========== СОЗДАНИЕ ГРУППЫ ==========
             else if (msg.type === 'create_group') {
                 const { name, avatar, members } = msg;
-                if (!name || !members || !Array.isArray(members) || members.length === 0) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Название и участники обязательны' }));
-                    return;
-                }
+                if (!name || !members?.length) return;
                 const groupId = generateId();
                 await pool.query('INSERT INTO groups (id, name, avatar, created_by) VALUES ($1, $2, $3, $4)',
                     [groupId, name, avatar || '👥', userPhone]);
                 const allMembers = [...new Set([userPhone, ...members])];
-                for (const member of allMembers) {
+                for (const m of allMembers) {
                     await pool.query('INSERT INTO group_members (group_id, user_phone, role) VALUES ($1, $2, $3)',
-                        [groupId, member, member === userPhone ? 'admin' : 'member']);
+                        [groupId, m, m === userPhone ? 'admin' : 'member']);
                 }
-                const group = { id: groupId, name, avatar: avatar || '👥', type: 'group' };
-                for (const member of allMembers) {
-                    const client = clients.get(member);
-                    if (client) {
-                        client.send(JSON.stringify({ type: 'group_created', group }));
-                    }
+                const group = { id: groupId, name, avatar: avatar || '👥' };
+                for (const m of allMembers) {
+                    const client = clients.get(m);
+                    if (client) client.send(JSON.stringify({ type: 'group_created', group }));
                 }
                 ws.send(JSON.stringify({ type: 'group_created', group }));
             }
 
-            // ========== ПОЛУЧЕНИЕ СПИСКА ЧАТОВ ==========
+            // ========== ПОЛУЧЕНИЕ КОНТАКТОВ ==========
             else if (msg.type === 'get_contacts') {
-                if (!userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
-                    return;
-                }
+                if (!userPhone) return;
                 const contactsRes = await pool.query('SELECT contact_phone FROM contacts WHERE user_phone = $1', [userPhone]);
                 const contacts = contactsRes.rows.map(r => r.contact_phone);
                 const groupsRes = await pool.query(`
@@ -330,197 +371,114 @@ wss.on('connection', (ws) => {
                     JOIN group_members gm ON g.id = gm.group_id
                     WHERE gm.user_phone = $1
                 `, [userPhone]);
-                const groups = groupsRes.rows;
-                ws.send(JSON.stringify({ type: 'contacts_list', contacts, groups }));
+                ws.send(JSON.stringify({ type: 'contacts_list', contacts, groups: groupsRes.rows }));
             }
 
-            // ========== ПОЛУЧЕНИЕ ИСТОРИИ СООБЩЕНИЙ ==========
+            // ========== ИСТОРИЯ СООБЩЕНИЙ ==========
             else if (msg.type === 'get_messages') {
-                if (!userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
-                    return;
-                }
-                try {
-                    const personalRes = await pool.query(
-                        `SELECT id, from_phone, to_phone, NULL as group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, delivered, read, timestamp
-                         FROM messages
-                         WHERE from_phone = $1 OR to_phone = $1`,
-                        [userPhone]
-                    );
-                    const groupRes = await pool.query(
-                        `SELECT m.id, m.from_phone, NULL as to_phone, m.group_id, m.content, m.encrypted, m.is_file, m.is_voice, m.file_name, m.file_size, m.file_type, m.delivered, m.read, m.timestamp
-                         FROM messages m
-                         JOIN group_members gm ON m.group_id = gm.group_id
-                         WHERE gm.user_phone = $1`,
-                        [userPhone]
-                    );
-                    const allMessages = [...personalRes.rows, ...groupRes.rows];
-                    ws.send(JSON.stringify({ type: 'messages_history', messages: allMessages }));
-                } catch (err) {
-                    console.error('Ошибка получения истории сообщений:', err);
-                    ws.send(JSON.stringify({ type: 'error', error: 'Ошибка получения сообщений: ' + err.message }));
-                }
+                if (!userPhone) return;
+                const personal = await pool.query(
+                    `SELECT id, from_phone, to_phone, NULL as group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, delivered, read, timestamp
+                     FROM messages WHERE from_phone = $1 OR to_phone = $1`, [userPhone]);
+                const group = await pool.query(
+                    `SELECT m.id, m.from_phone, NULL as to_phone, m.group_id, m.content, m.encrypted, m.is_file, m.is_voice, m.file_name, m.file_size, m.file_type, m.delivered, m.read, m.timestamp
+                     FROM messages m JOIN group_members gm ON m.group_id = gm.group_id WHERE gm.user_phone = $1`, [userPhone]);
+                ws.send(JSON.stringify({ type: 'messages_history', messages: [...personal.rows, ...group.rows] }));
             }
 
             // ========== ОТПРАВКА СООБЩЕНИЯ ==========
             else if (msg.type === 'chat_message') {
                 const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType } = msg;
-                if (!from || (!to && !groupId)) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Отправитель и получатель/группа обязательны' }));
-                    return;
-                }
-                if (from !== userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Нельзя отправить сообщение от чужого имени' }));
-                    return;
-                }
+                if (!from || (!to && !groupId)) return;
+                if (from !== userPhone) return;
 
                 if (to) {
-                    const recipientExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [to]);
-                    if (recipientExists.rows.length === 0) {
-                        ws.send(JSON.stringify({ type: 'error', error: 'Получатель не найден' }));
-                        return;
-                    }
+                    const exists = await pool.query('SELECT phone FROM users WHERE phone = $1', [to]);
+                    if (exists.rows.length === 0) return;
                 } else if (groupId) {
-                    const memberCheck = await pool.query('SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, from]);
-                    if (memberCheck.rows.length === 0) {
-                        ws.send(JSON.stringify({ type: 'error', error: 'Вы не состоите в этой группе' }));
-                        return;
-                    }
+                    const member = await pool.query('SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, from]);
+                    if (member.rows.length === 0) return;
                 }
 
-                // Вставка сообщения
                 await pool.query(
                     `INSERT INTO messages (id, from_phone, to_phone, group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
                     [id, from, to || null, groupId || null, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString()]
                 );
 
-                // Рассылка и подтверждение доставки
+                // Рассылка WebSocket
                 if (to) {
                     const recipientWs = clients.get(to);
                     if (recipientWs) {
-                        recipientWs.send(JSON.stringify({
-                            type: 'chat_message',
-                            id, from, fromName, to, content, encrypted: false, timestamp,
-                            isFile: isFile || false, isVoice: isVoice || false,
-                            fileName, fileSize, fileType
-                        }));
-                        // Помечаем как доставленное
+                        recipientWs.send(JSON.stringify(msg));
                         await pool.query('UPDATE messages SET delivered = true WHERE id = $1', [id]);
+                    } else {
+                        // Отправляем push, если получатель офлайн
+                        await sendPushNotification(to, fromName || from,
+                            isVoice ? '🎤 Голосовое' : (isFile ? `📎 ${fileName}` : content), {});
                     }
                     ws.send(JSON.stringify({ type: 'message_delivered', messageId: id, to }));
                 } else if (groupId) {
-                    // Получаем всех участников группы
-                    const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
-                    let deliveredCount = 0;
-                    for (const member of membersRes.rows) {
-                        if (member.user_phone === from) continue;
-                        const memberWs = clients.get(member.user_phone);
+                    const members = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
+                    let delivered = false;
+                    for (const m of members.rows) {
+                        if (m.user_phone === from) continue;
+                        const memberWs = clients.get(m.user_phone);
                         if (memberWs) {
-                            memberWs.send(JSON.stringify({
-                                type: 'chat_message',
-                                id, from, fromName, groupId, content, encrypted: false, timestamp,
-                                isFile: isFile || false, isVoice: isVoice || false,
-                                fileName, fileSize, fileType
-                            }));
-                            deliveredCount++;
+                            memberWs.send(JSON.stringify(msg));
+                            delivered = true;
+                        } else {
+                            await sendPushNotification(m.user_phone, fromName || from,
+                                isVoice ? '🎤 Голосовое' : (isFile ? `📎 ${fileName}` : content), {});
                         }
                     }
-                    // Если хотя бы один участник онлайн, помечаем сообщение как доставленное (можно уточнить логику)
-                    if (deliveredCount > 0) {
-                        await pool.query('UPDATE messages SET delivered = true WHERE id = $1', [id]);
-                    }
-                    // Отправляем подтверждение отправителю о доставке в группу
+                    if (delivered) await pool.query('UPDATE messages SET delivered = true WHERE id = $1', [id]);
                     ws.send(JSON.stringify({ type: 'message_delivered', messageId: id, groupId }));
                 }
-                console.log(`✅ Сообщение ${id} от ${from}`);
+                console.log(`✅ Сообщение ${id}`);
             }
 
-            // ========== ПОДТВЕРЖДЕНИЕ ПРОЧТЕНИЯ ==========
+            // ========== ПРОЧТЕНИЕ ==========
             else if (msg.type === 'read_receipt') {
                 const { messageIds, from, to, groupId } = msg;
                 if (!from || (!to && !groupId) || !messageIds) return;
-                if (from !== userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
-                    return;
-                }
+                if (from !== userPhone) return;
                 await pool.query('UPDATE messages SET read = true WHERE id = ANY($1::text[])', [messageIds]);
-                // Оповещаем отправителя(ей) о прочтении
                 if (to) {
                     const sender = clients.get(to);
                     if (sender) sender.send(JSON.stringify({ type: 'message_read', messageIds, from }));
                 } else if (groupId) {
-                    // Для групповых чатов можно оповестить всех отправителей этих сообщений (упрощённо)
-                    const sendersRes = await pool.query(
-                        'SELECT DISTINCT from_phone FROM messages WHERE id = ANY($1::text[]) AND group_id = $2',
-                        [messageIds, groupId]
-                    );
-                    for (const row of sendersRes.rows) {
-                        const senderWs = clients.get(row.from_phone);
+                    const senders = await pool.query('SELECT DISTINCT from_phone FROM messages WHERE id = ANY($1::text[]) AND group_id = $2', [messageIds, groupId]);
+                    for (const s of senders.rows) {
+                        const senderWs = clients.get(s.from_phone);
                         if (senderWs) senderWs.send(JSON.stringify({ type: 'message_read', messageIds, from }));
                     }
                 }
             }
 
-            // ========== ОБНОВЛЕНИЕ ПРОФИЛЯ ==========
+            // ========== ПРОФИЛЬ ==========
+            else if (msg.type === 'get_profile') {
+                const phone = msg.phone || userPhone;
+                const result = await pool.query('SELECT phone, name, avatar, status, email, settings, last_seen FROM users WHERE phone = $1', [phone]);
+                if (result.rows.length > 0) {
+                    ws.send(JSON.stringify({ type: 'profile_data', user: result.rows[0] }));
+                }
+            }
+
             else if (msg.type === 'update_profile') {
                 const { user } = msg;
-                if (!user || !user.phone) return;
-                if (user.phone !== userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Нельзя редактировать чужой профиль' }));
-                    return;
-                }
-                const fields = [];
-                const values = [];
+                if (!user || user.phone !== userPhone) return;
+                const fields = [], values = [];
                 let idx = 1;
                 if (user.name) { fields.push(`name = $${idx++}`); values.push(user.name); }
                 if (user.avatar) { fields.push(`avatar = $${idx++}`); values.push(user.avatar); }
                 if (user.status) { fields.push(`status = $${idx++}`); values.push(user.status); }
                 if (user.email) { fields.push(`email = $${idx++}`); values.push(user.email); }
-                if (user.settings) { fields.push(`settings = $${idx++}`); values.push(JSON.stringify(user.settings)); }
+                if (user.settings) { fields.push(`settings = $${idx++}`); values.push(user.settings); }
                 if (fields.length) {
-                    values.push(user.phone);
+                    values.push(userPhone);
                     await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE phone = $${idx}`, values);
                 }
-            }
-
-            // ========== ПОЛУЧЕНИЕ ПРОФИЛЯ ==========
-            else if (msg.type === 'get_profile') {
-                const phone = msg.phone || userPhone;
-                if (!phone) return;
-                const result = await pool.query('SELECT phone, name, avatar, status, email, settings, last_seen FROM users WHERE phone = $1', [phone]);
-                if (result.rows.length > 0) {
-                    ws.send(JSON.stringify({ type: 'profile_data', user: result.rows[0] }));
-                } else {
-                    ws.send(JSON.stringify({ type: 'profile_error', error: 'Пользователь не найден' }));
-                }
-            }
-
-            // ========== ПОЛУЧЕНИЕ ИНФОРМАЦИИ О ГРУППЕ ==========
-            else if (msg.type === 'get_group_info') {
-                const { groupId } = msg;
-                const groupRes = await pool.query('SELECT id, name, avatar FROM groups WHERE id = $1', [groupId]);
-                if (groupRes.rows.length === 0) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Группа не найдена' }));
-                    return;
-                }
-                const membersRes = await pool.query(`
-                    SELECT u.phone, u.name, u.avatar, gm.role
-                    FROM group_members gm
-                    JOIN users u ON gm.user_phone = u.phone
-                    WHERE gm.group_id = $1
-                `, [groupId]);
-                ws.send(JSON.stringify({
-                    type: 'group_info',
-                    group: groupRes.rows[0],
-                    members: membersRes.rows
-                }));
-            }
-
-            // ========== ИНДИКАТОР НАБОРА ==========
-            else if (msg.type === 'typing') {
-                const recipient = clients.get(msg.to);
-                if (recipient) recipient.send(JSON.stringify({ type: 'typing', from: msg.from }));
             }
 
             // ========== WEBRTC СИГНАЛИНГ ==========
@@ -531,11 +489,8 @@ wss.on('connection', (ws) => {
 
             // ========== СМЕНА ПАРОЛЯ ==========
             else if (msg.type === 'change_password') {
-                if (!userPhone || msg.phone !== userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
-                    return;
-                }
-                await pool.query('UPDATE users SET password = $1 WHERE phone = $2', [msg.newPassword, msg.phone]);
+                if (msg.phone !== userPhone) return;
+                await pool.query('UPDATE users SET password = $1 WHERE phone = $2', [msg.newPassword, userPhone]);
                 ws.send(JSON.stringify({ type: 'password_changed' }));
             }
 
@@ -543,11 +498,6 @@ wss.on('connection', (ws) => {
             else if (msg.type === 'logout') {
                 if (msg.token) await pool.query('DELETE FROM sessions WHERE token = $1', [msg.token]);
                 ws.send(JSON.stringify({ type: 'logout_success' }));
-            }
-
-            // ========== НЕИЗВЕСТНЫЙ ТИП ==========
-            else {
-                console.log(`⚠️ [${clientId}] Неизвестный тип сообщения: ${msg.type}`);
             }
 
         } catch (err) {
@@ -567,7 +517,7 @@ wss.on('connection', (ws) => {
     ws.on('error', (err) => console.error(`⚠️ [${clientId}] Ошибка сокета:`, err.message));
 });
 
-// ========== PING-ПРОВЕРКА ==========
+// ========== PING ==========
 setInterval(() => {
     wss.clients.forEach(ws => {
         if (ws.isAlive === false) return ws.terminate();
