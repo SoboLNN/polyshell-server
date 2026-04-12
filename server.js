@@ -59,21 +59,8 @@ async function initDatabase() {
             id TEXT PRIMARY KEY,
             from_phone VARCHAR(20) NOT NULL,
             to_phone VARCHAR(20),
-            group_id TEXT REFERENCES groups(id) ON DELETE CASCADE,
             content TEXT NOT NULL,
-            encrypted BOOLEAN DEFAULT false,
-            is_file BOOLEAN DEFAULT false,
-            is_voice BOOLEAN DEFAULT false,
-            file_name TEXT,
-            file_size BIGINT,
-            file_type TEXT,
-            delivered BOOLEAN DEFAULT false,
-            read BOOLEAN DEFAULT false,
-            timestamp TIMESTAMP DEFAULT NOW(),
-            CONSTRAINT target_check CHECK (
-                (to_phone IS NOT NULL AND group_id IS NULL) OR
-                (to_phone IS NULL AND group_id IS NOT NULL)
-            )
+            timestamp TIMESTAMP DEFAULT NOW()
         )
     `);
     // Сессии
@@ -84,7 +71,27 @@ async function initDatabase() {
             created_at TIMESTAMP DEFAULT NOW()
         )
     `);
-    console.log('✅ База данных инициализирована (с группами)');
+
+    // Миграции: добавляем недостающие колонки, если их нет
+    const addColumnIfNotExists = async (table, column, definition) => {
+        try {
+            await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
+        } catch (err) {
+            console.error(`Ошибка добавления колонки ${column} в ${table}:`, err.message);
+        }
+    };
+
+    await addColumnIfNotExists('messages', 'group_id', 'TEXT REFERENCES groups(id) ON DELETE CASCADE');
+    await addColumnIfNotExists('messages', 'encrypted', 'BOOLEAN DEFAULT false');
+    await addColumnIfNotExists('messages', 'is_file', 'BOOLEAN DEFAULT false');
+    await addColumnIfNotExists('messages', 'is_voice', 'BOOLEAN DEFAULT false');
+    await addColumnIfNotExists('messages', 'file_name', 'TEXT');
+    await addColumnIfNotExists('messages', 'file_size', 'BIGINT');
+    await addColumnIfNotExists('messages', 'file_type', 'TEXT');
+    await addColumnIfNotExists('messages', 'delivered', 'BOOLEAN DEFAULT false');
+    await addColumnIfNotExists('messages', 'read', 'BOOLEAN DEFAULT false');
+
+    console.log('✅ База данных инициализирована (с группами и миграциями)');
 }
 initDatabase().catch(console.error);
 
@@ -311,23 +318,28 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
                     return;
                 }
-                // Личные сообщения
-                const personalRes = await pool.query(
-                    `SELECT id, from_phone, to_phone, NULL as group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, delivered, read, timestamp
-                     FROM messages
-                     WHERE from_phone = $1 OR to_phone = $1`,
-                    [userPhone]
-                );
-                // Групповые сообщения (пользователь состоит в группе)
-                const groupRes = await pool.query(
-                    `SELECT m.id, m.from_phone, NULL as to_phone, m.group_id, m.content, m.encrypted, m.is_file, m.is_voice, m.file_name, m.file_size, m.file_type, m.delivered, m.read, m.timestamp
-                     FROM messages m
-                     JOIN group_members gm ON m.group_id = gm.group_id
-                     WHERE gm.user_phone = $1`,
-                    [userPhone]
-                );
-                const allMessages = [...personalRes.rows, ...groupRes.rows];
-                ws.send(JSON.stringify({ type: 'messages_history', messages: allMessages }));
+                try {
+                    // Личные сообщения
+                    const personalRes = await pool.query(
+                        `SELECT id, from_phone, to_phone, NULL as group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, delivered, read, timestamp
+                         FROM messages
+                         WHERE from_phone = $1 OR to_phone = $1`,
+                        [userPhone]
+                    );
+                    // Групповые сообщения (пользователь состоит в группе)
+                    const groupRes = await pool.query(
+                        `SELECT m.id, m.from_phone, NULL as to_phone, m.group_id, m.content, m.encrypted, m.is_file, m.is_voice, m.file_name, m.file_size, m.file_type, m.delivered, m.read, m.timestamp
+                         FROM messages m
+                         JOIN group_members gm ON m.group_id = gm.group_id
+                         WHERE gm.user_phone = $1`,
+                        [userPhone]
+                    );
+                    const allMessages = [...personalRes.rows, ...groupRes.rows];
+                    ws.send(JSON.stringify({ type: 'messages_history', messages: allMessages }));
+                } catch (err) {
+                    console.error('Ошибка получения истории сообщений:', err);
+                    ws.send(JSON.stringify({ type: 'error', error: 'Ошибка получения сообщений: ' + err.message }));
+                }
             }
 
             // ========== ОТПРАВКА СООБЩЕНИЯ ==========
@@ -390,25 +402,26 @@ wss.on('connection', (ws) => {
                             }));
                         }
                     }
-                    // Для групповых сообщений пока не шлём delivered индивидуально (можно позже)
+                    // Для групповых сообщений пока не шлём delivered индивидуально
                 }
                 console.log(`✅ Сообщение ${id} от ${from}`);
             }
 
-            // ========== ПОДТВЕРЖДЕНИЕ ПРОЧТЕНИЯ (ТОЛЬКО ДЛЯ ЛИЧНЫХ) ==========
+            // ========== ПОДТВЕРЖДЕНИЕ ПРОЧТЕНИЯ ==========
             if (msg.type === 'read_receipt') {
-                const { messageIds, from, to } = msg;
-                if (!from || !to || !messageIds) return;
+                const { messageIds, from, to, groupId } = msg;
+                if (!from || (!to && !groupId) || !messageIds) return;
                 if (from !== userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
                     return;
                 }
                 // Обновляем статус в БД
                 await pool.query('UPDATE messages SET read = true WHERE id = ANY($1::text[])', [messageIds]);
-                const sender = clients.get(to);
+                const sender = to ? clients.get(to) : null;
                 if (sender) {
                     sender.send(JSON.stringify({ type: 'message_read', messageIds, from }));
                 }
+                // Для групп можно оповестить всех участников (опционально)
             }
 
             // ========== ОБНОВЛЕНИЕ ПРОФИЛЯ ==========
@@ -470,7 +483,6 @@ wss.on('connection', (ws) => {
             if (msg.type === 'typing') {
                 const recipient = clients.get(msg.to);
                 if (recipient) recipient.send(JSON.stringify({ type: 'typing', from: msg.from }));
-                // для групп можно рассылать всем участникам, пока опустим
             }
 
             // ========== WEBRTC СИГНАЛИНГ ==========
