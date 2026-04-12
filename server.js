@@ -24,7 +24,7 @@ async function initDatabase() {
             last_seen TIMESTAMP DEFAULT NOW()
         )
     `);
-    // Контакты (для личных чатов)
+    // Контакты
     await pool.query(`
         CREATE TABLE IF NOT EXISTS contacts (
             user_phone VARCHAR(20) NOT NULL,
@@ -53,7 +53,7 @@ async function initDatabase() {
             PRIMARY KEY (group_id, user_phone)
         )
     `);
-    // Сообщения (поддерживают и личные, и групповые)
+    // Сообщения (поддержка личных и групповых)
     await pool.query(`
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
@@ -67,22 +67,13 @@ async function initDatabase() {
             file_name TEXT,
             file_size BIGINT,
             file_type TEXT,
+            delivered BOOLEAN DEFAULT false,
+            read BOOLEAN DEFAULT false,
             timestamp TIMESTAMP DEFAULT NOW(),
             CONSTRAINT target_check CHECK (
                 (to_phone IS NOT NULL AND group_id IS NULL) OR
                 (to_phone IS NULL AND group_id IS NOT NULL)
             )
-        )
-    `);
-    // Статусы доставки и прочтения для личных сообщений (можно расширить)
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS message_status (
-            message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-            user_phone VARCHAR(20) NOT NULL,
-            delivered BOOLEAN DEFAULT false,
-            read BOOLEAN DEFAULT false,
-            updated_at TIMESTAMP DEFAULT NOW(),
-            PRIMARY KEY (message_id, user_phone)
         )
     `);
     // Сессии
@@ -282,8 +273,9 @@ wss.on('connection', (ws) => {
                     await pool.query('INSERT INTO group_members (group_id, user_phone, role) VALUES ($1, $2, $3)',
                         [groupId, member, member === userPhone ? 'admin' : 'member']);
                 }
-                // Оповещаем онлайн-участников
+                // Получаем информацию о группе для рассылки
                 const group = { id: groupId, name, avatar: avatar || '👥', type: 'group' };
+                // Оповещаем онлайн-участников
                 for (const member of allMembers) {
                     const client = clients.get(member);
                     if (client) {
@@ -309,7 +301,7 @@ wss.on('connection', (ws) => {
                     JOIN group_members gm ON g.id = gm.group_id
                     WHERE gm.user_phone = $1
                 `, [userPhone]);
-                const groups = groupsRes.rows.map(g => ({ ...g, type: 'group' }));
+                const groups = groupsRes.rows;
                 ws.send(JSON.stringify({ type: 'contacts_list', contacts, groups }));
             }
 
@@ -321,22 +313,20 @@ wss.on('connection', (ws) => {
                 }
                 // Личные сообщения
                 const personalRes = await pool.query(
-                    `SELECT id, from_phone, to_phone, NULL as group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp
+                    `SELECT id, from_phone, to_phone, NULL as group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, delivered, read, timestamp
                      FROM messages
                      WHERE from_phone = $1 OR to_phone = $1`,
                     [userPhone]
                 );
                 // Групповые сообщения (пользователь состоит в группе)
                 const groupRes = await pool.query(
-                    `SELECT m.id, m.from_phone, NULL as to_phone, m.group_id, m.content, m.encrypted, m.is_file, m.is_voice, m.file_name, m.file_size, m.file_type, m.timestamp
+                    `SELECT m.id, m.from_phone, NULL as to_phone, m.group_id, m.content, m.encrypted, m.is_file, m.is_voice, m.file_name, m.file_size, m.file_type, m.delivered, m.read, m.timestamp
                      FROM messages m
                      JOIN group_members gm ON m.group_id = gm.group_id
                      WHERE gm.user_phone = $1`,
                     [userPhone]
                 );
                 const allMessages = [...personalRes.rows, ...groupRes.rows];
-                // Получаем статусы доставки/прочтения для личных сообщений
-                // (для групповых пока упрощённо: не храним индивидуальные статусы)
                 ws.send(JSON.stringify({ type: 'messages_history', messages: allMessages }));
             }
 
@@ -413,6 +403,8 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
                     return;
                 }
+                // Обновляем статус в БД
+                await pool.query('UPDATE messages SET read = true WHERE id = ANY($1::text[])', [messageIds]);
                 const sender = clients.get(to);
                 if (sender) {
                     sender.send(JSON.stringify({ type: 'message_read', messageIds, from }));
