@@ -95,6 +95,16 @@ async function initDatabase() {
             created_at TIMESTAMP DEFAULT NOW()
         )
     `);
+    // Закреплённые сообщения
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pinned_messages (
+            chat_id TEXT NOT NULL,
+            message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            pinned_by VARCHAR(20) NOT NULL REFERENCES users(phone),
+            pinned_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (chat_id)
+        )
+    `);
 
     // Миграции: добавляем недостающие колонки, если их нет
     const addColumnIfNotExists = async (table, column, definition) => {
@@ -111,7 +121,8 @@ async function initDatabase() {
     await addColumnIfNotExists('messages', 'file_type', 'TEXT');
     await addColumnIfNotExists('messages', 'delivered', 'BOOLEAN DEFAULT false');
     await addColumnIfNotExists('messages', 'read', 'BOOLEAN DEFAULT false');
-    await addColumnIfNotExists('messages', 'replied_to', 'TEXT'); // для ответов на сообщения
+    await addColumnIfNotExists('messages', 'replied_to', 'TEXT');
+    await addColumnIfNotExists('messages', 'edited', 'BOOLEAN DEFAULT false');
     await addColumnIfNotExists('users', 'fcm_token', 'TEXT');
 
     // Снимаем ограничение NOT NULL с to_phone (т.к. для групповых сообщений оно NULL)
@@ -130,6 +141,7 @@ async function initDatabase() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp DESC)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_group_members_user_phone ON group_members(user_phone)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_contacts_user_phone ON contacts(user_phone)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_pinned_messages_chat_id ON pinned_messages(chat_id)`);
 
     console.log('✅ База данных инициализирована с индексами и миграциями');
 }
@@ -384,7 +396,7 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'contacts_list', contacts, groups }));
             }
 
-            // ========== ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ СООБЩЕНИЙ (РАЗДЕЛЬНЫЙ ЗАПРОС) ==========
+            // ========== ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ СООБЩЕНИЙ ==========
             else if (msg.type === 'get_personal_messages') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -397,7 +409,7 @@ wss.on('connection', (ws) => {
                         `SELECT id, from_phone, to_phone, NULL as group_id,
                                 content, encrypted, is_file, is_voice,
                                 file_name, file_size, file_type,
-                                delivered, read, timestamp, replied_to
+                                delivered, read, timestamp, replied_to, edited
                          FROM messages
                          WHERE (from_phone = $1 OR to_phone = $1)
                            AND group_id IS NULL
@@ -406,6 +418,13 @@ wss.on('connection', (ws) => {
                         [userPhone, limit, offset]
                     );
                     const messages = result.rows.reverse();
+                    
+                    // Получаем закреплённое сообщение для чата с самим собой (если есть)
+                    // Для личных чатов chat_id = телефон собеседника, но для истории мы возвращаем все личные сообщения
+                    // Закреплённое сообщение нужно для конкретного собеседника, поэтому здесь не возвращаем
+                    // Клиент запросит отдельно при входе в чат, либо можно вернуть мапу chat_id -> pinned_message
+                    // Но для простоты добавим отдельный запрос get_pinned_message
+                    
                     ws.send(JSON.stringify({ type: 'personal_messages_history', messages }));
                 } catch (err) {
                     console.error('Ошибка получения личных сообщений:', err);
@@ -426,7 +445,7 @@ wss.on('connection', (ws) => {
                         `SELECT m.id, m.from_phone, NULL as to_phone, m.group_id,
                                 m.content, m.encrypted, m.is_file, m.is_voice,
                                 m.file_name, m.file_size, m.file_type,
-                                m.delivered, m.read, m.timestamp, m.replied_to
+                                m.delivered, m.read, m.timestamp, m.replied_to, m.edited
                          FROM messages m
                          INNER JOIN group_members gm ON m.group_id = gm.group_id
                          WHERE gm.user_phone = $1
@@ -439,6 +458,38 @@ wss.on('connection', (ws) => {
                 } catch (err) {
                     console.error('Ошибка получения групповых сообщений:', err);
                     ws.send(JSON.stringify({ type: 'error', error: 'Ошибка получения сообщений: ' + err.message }));
+                }
+            }
+
+            // ========== ПОЛУЧЕНИЕ ЗАКРЕПЛЁННОГО СООБЩЕНИЯ ДЛЯ ЧАТА ==========
+            else if (msg.type === 'get_pinned_message') {
+                if (!userPhone) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
+                    return;
+                }
+                const chatId = msg.chatId; // ID чата (телефон собеседника или groupId)
+                if (!chatId) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан chatId' }));
+                    return;
+                }
+                try {
+                    const pinnedRes = await pool.query(
+                        `SELECT m.id, m.from_phone, m.to_phone, m.group_id, m.content,
+                                m.is_file, m.is_voice, m.file_name, m.file_size, m.file_type,
+                                m.timestamp, pm.pinned_by, pm.pinned_at
+                         FROM pinned_messages pm
+                         JOIN messages m ON pm.message_id = m.id
+                         WHERE pm.chat_id = $1`,
+                        [chatId]
+                    );
+                    if (pinnedRes.rows.length > 0) {
+                        ws.send(JSON.stringify({ type: 'pinned_message', message: pinnedRes.rows[0], chatId }));
+                    } else {
+                        ws.send(JSON.stringify({ type: 'pinned_message', message: null, chatId }));
+                    }
+                } catch (err) {
+                    console.error('Ошибка получения закреплённого сообщения:', err);
+                    ws.send(JSON.stringify({ type: 'error', error: 'Ошибка получения закреплённого сообщения' }));
                 }
             }
 
@@ -546,6 +597,226 @@ wss.on('connection', (ws) => {
                 console.log(`🗑️ Сообщение ${messageId} удалено`);
             }
 
+            // ========== РЕДАКТИРОВАНИЕ СООБЩЕНИЯ ==========
+            else if (msg.type === 'edit_message') {
+                const { messageId, newContent, from, to, groupId } = msg;
+                if (!messageId || !newContent || !from) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно данных для редактирования' }));
+                    return;
+                }
+                if (from !== userPhone) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Нельзя редактировать чужое сообщение' }));
+                    return;
+                }
+
+                const msgCheck = await pool.query(
+                    'SELECT from_phone, group_id, to_phone FROM messages WHERE id = $1',
+                    [messageId]
+                );
+                if (msgCheck.rows.length === 0) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Сообщение не найдено' }));
+                    return;
+                }
+                if (msgCheck.rows[0].from_phone !== from) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав для редактирования' }));
+                    return;
+                }
+
+                await pool.query(
+                    `UPDATE messages SET content = $1, edited = true WHERE id = $2`,
+                    [newContent, messageId]
+                );
+
+                const editedMessage = {
+                    type: 'message_edited',
+                    messageId,
+                    newContent,
+                    chatId: groupId || to,
+                    from
+                };
+
+                if (to) {
+                    const recipientWs = clients.get(to);
+                    if (recipientWs) {
+                        recipientWs.send(JSON.stringify(editedMessage));
+                    }
+                    ws.send(JSON.stringify(editedMessage));
+                } else if (groupId) {
+                    const membersRes = await pool.query(
+                        'SELECT user_phone FROM group_members WHERE group_id = $1',
+                        [groupId]
+                    );
+                    for (const member of membersRes.rows) {
+                        const memberWs = clients.get(member.user_phone);
+                        if (memberWs) {
+                            memberWs.send(JSON.stringify(editedMessage));
+                        }
+                    }
+                }
+
+                console.log(`✏️ Сообщение ${messageId} отредактировано`);
+            }
+
+            // ========== ЗАКРЕПЛЕНИЕ СООБЩЕНИЯ ==========
+            else if (msg.type === 'pin_message') {
+                const { messageId, chatId } = msg; // chatId = to (телефон) или groupId
+                if (!messageId || !chatId || !userPhone) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Не указаны messageId или chatId' }));
+                    return;
+                }
+
+                // Проверяем существование сообщения и права (пользователь должен быть участником чата)
+                const msgCheck = await pool.query(
+                    `SELECT id, from_phone, to_phone, group_id, content, is_file, is_voice,
+                            file_name, file_size, file_type, timestamp
+                     FROM messages WHERE id = $1`,
+                    [messageId]
+                );
+                if (msgCheck.rows.length === 0) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Сообщение не найдено' }));
+                    return;
+                }
+                const message = msgCheck.rows[0];
+
+                // Проверяем, что пользователь имеет доступ к чату
+                let hasAccess = false;
+                if (message.group_id) {
+                    // Групповой чат
+                    if (message.group_id !== chatId) {
+                        ws.send(JSON.stringify({ type: 'error', error: 'chatId не соответствует group_id сообщения' }));
+                        return;
+                    }
+                    const memberCheck = await pool.query(
+                        'SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2',
+                        [chatId, userPhone]
+                    );
+                    hasAccess = memberCheck.rows.length > 0;
+                } else {
+                    // Личный чат: chatId должен быть телефоном собеседника
+                    if ((message.to_phone && message.to_phone !== chatId && message.from_phone !== chatId) ||
+                        (!message.to_phone && message.from_phone !== chatId)) {
+                        ws.send(JSON.stringify({ type: 'error', error: 'chatId не соответствует участнику чата' }));
+                        return;
+                    }
+                    // Проверяем, что пользователь является одним из участников
+                    if (message.from_phone === userPhone || message.to_phone === userPhone) {
+                        hasAccess = true;
+                    }
+                }
+
+                if (!hasAccess) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Нет доступа к этому чату' }));
+                    return;
+                }
+
+                // Заменяем существующее закрепление для этого чата (ON CONFLICT)
+                await pool.query(
+                    `INSERT INTO pinned_messages (chat_id, message_id, pinned_by, pinned_at)
+                     VALUES ($1, $2, $3, NOW())
+                     ON CONFLICT (chat_id) DO UPDATE SET
+                         message_id = EXCLUDED.message_id,
+                         pinned_by = EXCLUDED.pinned_by,
+                         pinned_at = NOW()`,
+                    [chatId, messageId, userPhone]
+                );
+
+                // Оповещаем всех участников чата о новом закреплении
+                const pinNotification = {
+                    type: 'pin_message',
+                    chatId,
+                    message: {
+                        id: message.id,
+                        from_phone: message.from_phone,
+                        content: message.content,
+                        is_file: message.is_file,
+                        is_voice: message.is_voice,
+                        file_name: message.file_name,
+                        file_size: message.file_size,
+                        file_type: message.file_type,
+                        timestamp: message.timestamp
+                    },
+                    pinned_by: userPhone
+                };
+
+                if (!message.group_id) {
+                    // Личный чат
+                    const otherPhone = message.from_phone === userPhone ? message.to_phone : message.from_phone;
+                    const otherWs = clients.get(otherPhone);
+                    if (otherWs) otherWs.send(JSON.stringify(pinNotification));
+                    ws.send(JSON.stringify(pinNotification));
+                } else {
+                    // Групповой чат
+                    const membersRes = await pool.query(
+                        'SELECT user_phone FROM group_members WHERE group_id = $1',
+                        [chatId]
+                    );
+                    for (const member of membersRes.rows) {
+                        const memberWs = clients.get(member.user_phone);
+                        if (memberWs) memberWs.send(JSON.stringify(pinNotification));
+                    }
+                }
+
+                console.log(`📌 Сообщение ${messageId} закреплено в чате ${chatId} пользователем ${userPhone}`);
+            }
+
+            // ========== ОТКРЕПЛЕНИЕ СООБЩЕНИЯ ==========
+            else if (msg.type === 'unpin_message') {
+                const { chatId } = msg;
+                if (!chatId || !userPhone) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан chatId' }));
+                    return;
+                }
+
+                // Проверяем, что пользователь имеет доступ к чату
+                let hasAccess = false;
+                // Если chatId не содержит дефисов и длина <=20, возможно это телефон
+                if (!chatId.includes('-') && chatId.length <= 20) {
+                    // Личный чат
+                    hasAccess = true; // Достаточно быть авторизованным, точнее проверим ниже
+                } else {
+                    // Групповой чат
+                    const memberCheck = await pool.query(
+                        'SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2',
+                        [chatId, userPhone]
+                    );
+                    hasAccess = memberCheck.rows.length > 0;
+                }
+
+                if (!hasAccess) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Нет доступа к этому чату' }));
+                    return;
+                }
+
+                // Удаляем запись о закреплении
+                await pool.query('DELETE FROM pinned_messages WHERE chat_id = $1', [chatId]);
+
+                // Оповещаем всех участников
+                const unpinNotification = {
+                    type: 'unpin_message',
+                    chatId,
+                    by: userPhone
+                };
+
+                if (!chatId.includes('-') && chatId.length <= 20) {
+                    // Личный чат: отправляем собеседнику
+                    const otherWs = clients.get(chatId);
+                    if (otherWs) otherWs.send(JSON.stringify(unpinNotification));
+                    ws.send(JSON.stringify(unpinNotification));
+                } else {
+                    // Групповой чат
+                    const membersRes = await pool.query(
+                        'SELECT user_phone FROM group_members WHERE group_id = $1',
+                        [chatId]
+                    );
+                    for (const member of membersRes.rows) {
+                        const memberWs = clients.get(member.user_phone);
+                        if (memberWs) memberWs.send(JSON.stringify(unpinNotification));
+                    }
+                }
+
+                console.log(`📌 Закрепление в чате ${chatId} снято пользователем ${userPhone}`);
+            }
+
             // ========== УДАЛЕНИЕ ЧАТА ==========
             else if (msg.type === 'delete_chat') {
                 const { chatId, with: withPhone } = msg;
@@ -554,6 +825,8 @@ wss.on('connection', (ws) => {
                 await pool.query('DELETE FROM messages WHERE (from_phone = $1 AND to_phone = $2) OR (from_phone = $2 AND to_phone = $1)', [userPhone, withPhone]);
                 // Удаляем контакты
                 await pool.query('DELETE FROM contacts WHERE (user_phone = $1 AND contact_phone = $2) OR (user_phone = $2 AND contact_phone = $1)', [userPhone, withPhone]);
+                // Удаляем закрепление
+                await pool.query('DELETE FROM pinned_messages WHERE chat_id = $1', [chatId]);
                 // Оповещаем собеседника
                 const otherWs = clients.get(withPhone);
                 if (otherWs) otherWs.send(JSON.stringify({ type: 'chat_deleted', chatId }));
@@ -577,7 +850,7 @@ wss.on('connection', (ws) => {
                 }
                 // Получаем участников для оповещения
                 const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
-                // Удаляем группу (каскадно удалятся участники и сообщения)
+                // Удаляем группу (каскадно удалятся участники, сообщения и закрепления)
                 await pool.query('DELETE FROM groups WHERE id = $1', [groupId]);
                 for (const member of membersRes.rows) {
                     const memberWs = clients.get(member.user_phone);
