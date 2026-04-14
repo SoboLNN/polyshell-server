@@ -461,60 +461,59 @@ wss.on('connection', (ws) => {
 
             // ========== ПОЛУЧЕНИЕ ЗАКРЕПЛЁННОГО СООБЩЕНИЯ ДЛЯ ЧАТА ==========
             else if (msg.type === 'get_pinned_message') {
-                if (!userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
-                    return;
-                }
-                const chatId = msg.chatId;
-                if (!chatId) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан chatId' }));
-                    return;
-                }
+    if (!userPhone) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
+        return;
+    }
+    const clientChatId = msg.chatId;
+    if (!clientChatId) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Не указан chatId' }));
+        return;
+    }
 
-                let canonicalChatId;
-                let hasAccess = false;
+    let canonicalChatId;
+    let hasAccess = false;
 
-                const groupCheck = await pool.query('SELECT id FROM groups WHERE id = $1', [chatId]);
-                if (groupCheck.rows.length > 0) {
-                    canonicalChatId = chatId;
-                    const memberCheck = await pool.query(
-                        'SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2',
-                        [canonicalChatId, userPhone]
-                    );
-                    hasAccess = memberCheck.rows.length > 0;
-                } else {
-                    // Личный чат: chatId, вероятно, телефон собеседника
-                    const otherPhone = chatId;
-                    canonicalChatId = getCanonicalPrivateChatId(userPhone, otherPhone);
-                    const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [otherPhone]);
-                    hasAccess = userExists.rows.length > 0;
-                }
+    const groupCheck = await pool.query('SELECT id FROM groups WHERE id = $1', [clientChatId]);
+    if (groupCheck.rows.length > 0) {
+        canonicalChatId = clientChatId;
+        const memberCheck = await pool.query(
+            'SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2',
+            [canonicalChatId, userPhone]
+        );
+        hasAccess = memberCheck.rows.length > 0;
+    } else {
+        const otherPhone = clientChatId;
+        canonicalChatId = getCanonicalPrivateChatId(userPhone, otherPhone);
+        const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [otherPhone]);
+        hasAccess = userExists.rows.length > 0;
+    }
 
-                if (!hasAccess) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Нет доступа к этому чату' }));
-                    return;
-                }
+    if (!hasAccess) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Нет доступа к этому чату' }));
+        return;
+    }
 
-                try {
-                    const pinnedRes = await pool.query(
-                        `SELECT m.id, m.from_phone, m.to_phone, m.group_id, m.content,
-                                m.is_file, m.is_voice, m.file_name, m.file_size, m.file_type,
-                                m.timestamp, pm.pinned_by, pm.pinned_at
-                         FROM pinned_messages pm
-                         JOIN messages m ON pm.message_id = m.id
-                         WHERE pm.chat_id = $1`,
-                        [canonicalChatId]
-                    );
-                    if (pinnedRes.rows.length > 0) {
-                        ws.send(JSON.stringify({ type: 'pinned_message', message: pinnedRes.rows[0], chatId: canonicalChatId }));
-                    } else {
-                        ws.send(JSON.stringify({ type: 'pinned_message', message: null, chatId: canonicalChatId }));
-                    }
-                } catch (err) {
-                    console.error('Ошибка получения закреплённого сообщения:', err);
-                    ws.send(JSON.stringify({ type: 'error', error: 'Ошибка получения закреплённого сообщения' }));
-                }
-            }
+    try {
+        const pinnedRes = await pool.query(
+            `SELECT m.id, m.from_phone, m.to_phone, m.group_id, m.content,
+                    m.is_file, m.is_voice, m.file_name, m.file_size, m.file_type,
+                    m.timestamp, pm.pinned_by, pm.pinned_at
+             FROM pinned_messages pm
+             JOIN messages m ON pm.message_id = m.id
+             WHERE pm.chat_id = $1`,
+            [canonicalChatId]
+        );
+        if (pinnedRes.rows.length > 0) {
+            ws.send(JSON.stringify({ type: 'pinned_message', message: pinnedRes.rows[0], chatId: clientChatId }));
+        } else {
+            ws.send(JSON.stringify({ type: 'pinned_message', message: null, chatId: clientChatId }));
+        }
+    } catch (err) {
+        console.error('Ошибка получения закреплённого сообщения:', err);
+        ws.send(JSON.stringify({ type: 'error', error: 'Ошибка получения закреплённого сообщения' }));
+    }
+}
 
             // ========== ОТПРАВКА СООБЩЕНИЯ ==========
             else if (msg.type === 'chat_message') {
@@ -680,159 +679,161 @@ wss.on('connection', (ws) => {
 
             // ========== ЗАКРЕПЛЕНИЕ СООБЩЕНИЯ ==========
             else if (msg.type === 'pin_message') {
-                const { messageId, chatId } = msg;
-                if (!messageId || !chatId || !userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не указаны messageId или chatId' }));
-                    return;
-                }
+    const { messageId, chatId } = msg;
+    const clientChatId = chatId; // ← сохраняем оригинальный chatId от клиента
+    if (!messageId || !clientChatId || !userPhone) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Не указаны messageId или chatId' }));
+        return;
+    }
 
-                const msgCheck = await pool.query(
-                    `SELECT id, from_phone, to_phone, group_id, content, is_file, is_voice,
-                            file_name, file_size, file_type, timestamp
-                     FROM messages WHERE id = $1`,
-                    [messageId]
-                );
-                if (msgCheck.rows.length === 0) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Сообщение не найдено' }));
-                    return;
-                }
-                const message = msgCheck.rows[0];
+    const msgCheck = await pool.query(
+        `SELECT id, from_phone, to_phone, group_id, content, is_file, is_voice,
+                file_name, file_size, file_type, timestamp
+         FROM messages WHERE id = $1`,
+        [messageId]
+    );
+    if (msgCheck.rows.length === 0) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Сообщение не найдено' }));
+        return;
+    }
+    const message = msgCheck.rows[0];
 
-                let canonicalChatId;
-                let hasAccess = false;
+    let canonicalChatId;
+    let hasAccess = false;
 
-                if (message.group_id) {
-                    if (message.group_id !== chatId) {
-                        ws.send(JSON.stringify({ type: 'error', error: 'chatId не соответствует group_id сообщения' }));
-                        return;
-                    }
-                    canonicalChatId = message.group_id;
-                    const memberCheck = await pool.query(
-                        'SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2',
-                        [canonicalChatId, userPhone]
-                    );
-                    hasAccess = memberCheck.rows.length > 0;
-                } else {
-                    const participant1 = message.from_phone;
-                    const participant2 = message.to_phone;
-                    if (!participant1 || !participant2) {
-                        ws.send(JSON.stringify({ type: 'error', error: 'Не удалось определить участников чата' }));
-                        return;
-                    }
-                    canonicalChatId = getCanonicalPrivateChatId(participant1, participant2);
-                    if (participant1 === userPhone || participant2 === userPhone) {
-                        hasAccess = true;
-                    }
-                }
+    if (message.group_id) {
+        if (message.group_id !== clientChatId) {
+            ws.send(JSON.stringify({ type: 'error', error: 'chatId не соответствует group_id сообщения' }));
+            return;
+        }
+        canonicalChatId = message.group_id;
+        const memberCheck = await pool.query(
+            'SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2',
+            [canonicalChatId, userPhone]
+        );
+        hasAccess = memberCheck.rows.length > 0;
+    } else {
+        const participant1 = message.from_phone;
+        const participant2 = message.to_phone;
+        if (!participant1 || !participant2) {
+            ws.send(JSON.stringify({ type: 'error', error: 'Не удалось определить участников чата' }));
+            return;
+        }
+        canonicalChatId = getCanonicalPrivateChatId(participant1, participant2);
+        if (participant1 === userPhone || participant2 === userPhone) {
+            hasAccess = true;
+        }
+    }
 
-                if (!hasAccess) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Нет доступа к этому чату' }));
-                    return;
-                }
+    if (!hasAccess) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Нет доступа к этому чату' }));
+        return;
+    }
 
-                await pool.query(
-                    `INSERT INTO pinned_messages (chat_id, message_id, pinned_by, pinned_at)
-                     VALUES ($1, $2, $3, NOW())
-                     ON CONFLICT (chat_id) DO UPDATE SET
-                         message_id = EXCLUDED.message_id,
-                         pinned_by = EXCLUDED.pinned_by,
-                         pinned_at = NOW()`,
-                    [canonicalChatId, messageId, userPhone]
-                );
+    await pool.query(
+        `INSERT INTO pinned_messages (chat_id, message_id, pinned_by, pinned_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (chat_id) DO UPDATE SET
+             message_id = EXCLUDED.message_id,
+             pinned_by = EXCLUDED.pinned_by,
+             pinned_at = NOW()`,
+        [canonicalChatId, messageId, userPhone]
+    );
 
-                const pinNotification = {
-                    type: 'pin_message',
-                    chatId: canonicalChatId,
-                    message: {
-                        id: message.id,
-                        from_phone: message.from_phone,
-                        content: message.content,
-                        is_file: message.is_file,
-                        is_voice: message.is_voice,
-                        file_name: message.file_name,
-                        file_size: message.file_size,
-                        file_type: message.file_type,
-                        timestamp: message.timestamp
-                    },
-                    pinned_by: userPhone
-                };
+    const pinNotification = {
+        type: 'pin_message',
+        chatId: clientChatId, // ← используем оригинальный chatId клиента
+        message: {
+            id: message.id,
+            from_phone: message.from_phone,
+            content: message.content,
+            is_file: message.is_file,
+            is_voice: message.is_voice,
+            file_name: message.file_name,
+            file_size: message.file_size,
+            file_type: message.file_type,
+            timestamp: message.timestamp
+        },
+        pinned_by: userPhone
+    };
 
-                if (!message.group_id) {
-                    const otherPhone = message.from_phone === userPhone ? message.to_phone : message.from_phone;
-                    const otherWs = clients.get(otherPhone);
-                    if (otherWs) otherWs.send(JSON.stringify(pinNotification));
-                    ws.send(JSON.stringify(pinNotification));
-                } else {
-                    const membersRes = await pool.query(
-                        'SELECT user_phone FROM group_members WHERE group_id = $1',
-                        [canonicalChatId]
-                    );
-                    for (const member of membersRes.rows) {
-                        const memberWs = clients.get(member.user_phone);
-                        if (memberWs) memberWs.send(JSON.stringify(pinNotification));
-                    }
-                }
+    if (!message.group_id) {
+        const otherPhone = message.from_phone === userPhone ? message.to_phone : message.from_phone;
+        const otherWs = clients.get(otherPhone);
+        if (otherWs) otherWs.send(JSON.stringify(pinNotification));
+        ws.send(JSON.stringify(pinNotification));
+    } else {
+        const membersRes = await pool.query(
+            'SELECT user_phone FROM group_members WHERE group_id = $1',
+            [canonicalChatId]
+        );
+        for (const member of membersRes.rows) {
+            const memberWs = clients.get(member.user_phone);
+            if (memberWs) memberWs.send(JSON.stringify(pinNotification));
+        }
+    }
 
-                console.log(`📌 Сообщение ${messageId} закреплено в чате ${canonicalChatId} пользователем ${userPhone}`);
-            }
+    console.log(`📌 Сообщение ${messageId} закреплено в чате ${canonicalChatId} пользователем ${userPhone}`);
+}
 
             // ========== ОТКРЕПЛЕНИЕ СООБЩЕНИЯ ==========
             else if (msg.type === 'unpin_message') {
-                const { chatId } = msg;
-                if (!chatId || !userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан chatId' }));
-                    return;
-                }
+    const { chatId } = msg;
+    const clientChatId = chatId;
+    if (!clientChatId || !userPhone) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Не указан chatId' }));
+        return;
+    }
 
-                let canonicalChatId;
-                let hasAccess = false;
+    let canonicalChatId;
+    let hasAccess = false;
 
-                const groupCheck = await pool.query('SELECT id FROM groups WHERE id = $1', [chatId]);
-                if (groupCheck.rows.length > 0) {
-                    canonicalChatId = chatId;
-                    const memberCheck = await pool.query(
-                        'SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2',
-                        [canonicalChatId, userPhone]
-                    );
-                    hasAccess = memberCheck.rows.length > 0;
-                } else {
-                    const otherPhone = chatId;
-                    canonicalChatId = getCanonicalPrivateChatId(userPhone, otherPhone);
-                    const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [otherPhone]);
-                    hasAccess = userExists.rows.length > 0;
-                }
+    const groupCheck = await pool.query('SELECT id FROM groups WHERE id = $1', [clientChatId]);
+    if (groupCheck.rows.length > 0) {
+        canonicalChatId = clientChatId;
+        const memberCheck = await pool.query(
+            'SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2',
+            [canonicalChatId, userPhone]
+        );
+        hasAccess = memberCheck.rows.length > 0;
+    } else {
+        const otherPhone = clientChatId;
+        canonicalChatId = getCanonicalPrivateChatId(userPhone, otherPhone);
+        const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [otherPhone]);
+        hasAccess = userExists.rows.length > 0;
+    }
 
-                if (!hasAccess) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Нет доступа к этому чату' }));
-                    return;
-                }
+    if (!hasAccess) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Нет доступа к этому чату' }));
+        return;
+    }
 
-                await pool.query('DELETE FROM pinned_messages WHERE chat_id = $1', [canonicalChatId]);
+    await pool.query('DELETE FROM pinned_messages WHERE chat_id = $1', [canonicalChatId]);
 
-                const unpinNotification = {
-                    type: 'unpin_message',
-                    chatId: canonicalChatId,
-                    by: userPhone
-                };
+    const unpinNotification = {
+        type: 'unpin_message',
+        chatId: clientChatId, // ← оригинальный chatId
+        by: userPhone
+    };
 
-                if (groupCheck.rows.length === 0) {
-                    const otherPhone = chatId;
-                    const otherWs = clients.get(otherPhone);
-                    if (otherWs) otherWs.send(JSON.stringify(unpinNotification));
-                    ws.send(JSON.stringify(unpinNotification));
-                } else {
-                    const membersRes = await pool.query(
-                        'SELECT user_phone FROM group_members WHERE group_id = $1',
-                        [canonicalChatId]
-                    );
-                    for (const member of membersRes.rows) {
-                        const memberWs = clients.get(member.user_phone);
-                        if (memberWs) memberWs.send(JSON.stringify(unpinNotification));
-                    }
-                }
+    if (groupCheck.rows.length === 0) {
+        const otherPhone = clientChatId;
+        const otherWs = clients.get(otherPhone);
+        if (otherWs) otherWs.send(JSON.stringify(unpinNotification));
+        ws.send(JSON.stringify(unpinNotification));
+    } else {
+        const membersRes = await pool.query(
+            'SELECT user_phone FROM group_members WHERE group_id = $1',
+            [canonicalChatId]
+        );
+        for (const member of membersRes.rows) {
+            const memberWs = clients.get(member.user_phone);
+            if (memberWs) memberWs.send(JSON.stringify(unpinNotification));
+        }
+    }
 
-                console.log(`📌 Закрепление в чате ${canonicalChatId} снято пользователем ${userPhone}`);
-            }
+    console.log(`📌 Закрепление в чате ${canonicalChatId} снято пользователем ${userPhone}`);
+}
 
             // ========== УДАЛЕНИЕ ЧАТА ==========
             else if (msg.type === 'delete_chat') {
