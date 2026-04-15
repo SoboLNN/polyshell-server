@@ -32,7 +32,6 @@ const pool = new Pool({
 
 // ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ==========
 async function initDatabase() {
-    // Пользователи
     await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
             phone VARCHAR(20) PRIMARY KEY,
@@ -46,7 +45,6 @@ async function initDatabase() {
             last_seen TIMESTAMP DEFAULT NOW()
         )
     `);
-    // Контакты
     await pool.query(`
         CREATE TABLE IF NOT EXISTS contacts (
             user_phone VARCHAR(20) NOT NULL,
@@ -55,7 +53,6 @@ async function initDatabase() {
             PRIMARY KEY (user_phone, contact_phone)
         )
     `);
-    // Группы
     await pool.query(`
         CREATE TABLE IF NOT EXISTS groups (
             id TEXT PRIMARY KEY,
@@ -65,7 +62,6 @@ async function initDatabase() {
             created_at TIMESTAMP DEFAULT NOW()
         )
     `);
-    // Участники групп
     await pool.query(`
         CREATE TABLE IF NOT EXISTS group_members (
             group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
@@ -75,7 +71,6 @@ async function initDatabase() {
             PRIMARY KEY (group_id, user_phone)
         )
     `);
-    // Сообщения
     await pool.query(`
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
@@ -85,7 +80,6 @@ async function initDatabase() {
             timestamp TIMESTAMP DEFAULT NOW()
         )
     `);
-    // Сессии
     await pool.query(`
         CREATE TABLE IF NOT EXISTS sessions (
             token VARCHAR(64) PRIMARY KEY,
@@ -93,7 +87,6 @@ async function initDatabase() {
             created_at TIMESTAMP DEFAULT NOW()
         )
     `);
-    // Закреплённые сообщения
     await pool.query(`
         CREATE TABLE IF NOT EXISTS pinned_messages (
             chat_id TEXT NOT NULL,
@@ -105,9 +98,7 @@ async function initDatabase() {
     `);
 
     const addColumnIfNotExists = async (table, column, definition) => {
-        try {
-            await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
-        } catch (e) {}
+        try { await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition}`); } catch (e) {}
     };
     await addColumnIfNotExists('messages', 'group_id', 'TEXT REFERENCES groups(id) ON DELETE CASCADE');
     await addColumnIfNotExists('messages', 'encrypted', 'BOOLEAN DEFAULT false');
@@ -122,9 +113,7 @@ async function initDatabase() {
     await addColumnIfNotExists('messages', 'edited', 'BOOLEAN DEFAULT false');
     await addColumnIfNotExists('users', 'fcm_token', 'TEXT');
 
-    try {
-        await pool.query(`ALTER TABLE messages ALTER COLUMN to_phone DROP NOT NULL`);
-    } catch (e) {}
+    try { await pool.query(`ALTER TABLE messages ALTER COLUMN to_phone DROP NOT NULL`); } catch (e) {}
     try {
         await pool.query(`ALTER TABLE messages DROP CONSTRAINT IF EXISTS target_check`);
         await pool.query(`ALTER TABLE messages ADD CONSTRAINT target_check CHECK ((to_phone IS NOT NULL AND group_id IS NULL) OR (to_phone IS NULL AND group_id IS NOT NULL))`);
@@ -142,9 +131,8 @@ async function initDatabase() {
 }
 initDatabase().catch(console.error);
 
-const clients = new Map(); // phone -> WebSocket
+const clients = new Map();
 
-// ========== HTTP + WEBSOCKET ==========
 const wss = new WebSocket.Server({ noServer: true });
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -158,7 +146,6 @@ server.on('upgrade', (request, socket, head) => {
 server.listen(PORT, '0.0.0.0');
 console.log(`🚀 Сервер запущен на порту ${PORT}`);
 
-// ========== УТИЛИТЫ ==========
 function generateToken() {
     return crypto.randomBytes(32).toString('hex');
 }
@@ -176,7 +163,6 @@ async function sendFCMNotification(phone, title, body, data = {}) {
         const userRes = await pool.query('SELECT fcm_token FROM users WHERE phone = $1', [phone]);
         const fcmToken = userRes.rows[0]?.fcm_token;
         if (!fcmToken) return;
-
         const authClient = await googleAuth.getClient();
         const accessToken = await authClient.getAccessToken();
         const fcmUrl = `https://fcm.googleapis.com/v1/projects/${FCM_PROJECT_ID}/messages:send`;
@@ -202,7 +188,6 @@ async function sendFCMNotification(phone, title, body, data = {}) {
     }
 }
 
-// ========== ОБРАБОТКА ПОДКЛЮЧЕНИЙ ==========
 wss.on('connection', (ws) => {
     const clientId = Math.random().toString(36).substr(2, 9);
     let userPhone = null;
@@ -215,7 +200,7 @@ wss.on('connection', (ws) => {
             const msg = JSON.parse(data);
             console.log(`📨 [${clientId}] ${msg.type}`);
 
-            // ========== РЕГИСТРАЦИЯ ==========
+            // ========== РЕГИСТРАЦИЯ / ВХОД / ПРОФИЛЬ / ПОИСК ==========
             if (msg.type === 'register') {
                 const { phone, name, password, avatar, email } = msg;
                 const existing = await pool.query('SELECT phone FROM users WHERE phone = $1', [phone]);
@@ -239,8 +224,6 @@ wss.on('connection', (ws) => {
                 await pool.query('UPDATE users SET status = $1, last_seen = NOW() WHERE phone = $2', ['онлайн', phone]);
                 console.log(`✅ [${clientId}] Зарегистрирован ${phone}`);
             }
-
-            // ========== ВХОД ==========
             else if (msg.type === 'login') {
                 const { phone, password } = msg;
                 const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
@@ -267,10 +250,8 @@ wss.on('connection', (ws) => {
                         status: 'онлайн', email: userData.email, settings: userData.settings
                     }
                 }));
-                console.log(`✅ [${clientId}] Вход ${phone}, выдан токен ${token}`);
+                console.log(`✅ [${clientId}] Вход ${phone}`);
             }
-
-            // ========== ВХОД ПО ТОКЕНУ ==========
             else if (msg.type === 'login_with_token') {
                 const { token } = msg;
                 const session = await pool.query('SELECT phone FROM sessions WHERE token = $1', [token]);
@@ -297,10 +278,8 @@ wss.on('connection', (ws) => {
                         status: 'онлайн', email: userData.email, settings: userData.settings
                     }
                 }));
-                console.log(`✅ [${clientId}] Автовход по токену ${token} для ${phone}`);
+                console.log(`✅ [${clientId}] Автовход ${phone}`);
             }
-
-            // ========== ПОИСК ПОЛЬЗОВАТЕЛЯ ==========
             else if (msg.type === 'find_user') {
                 const result = await pool.query('SELECT phone, name, avatar, status, last_seen FROM users WHERE phone = $1', [msg.phone]);
                 if (result.rows.length > 0) {
@@ -309,8 +288,6 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'user_not_found' }));
                 }
             }
-
-            // ========== СОЗДАНИЕ ЛИЧНОГО ЧАТА ==========
             else if (msg.type === 'create_chat') {
                 const from = userPhone;
                 const to = msg.to;
@@ -326,16 +303,11 @@ wss.on('connection', (ws) => {
                     }
                     await pool.query('INSERT INTO contacts (user_phone, contact_phone) VALUES ($1, $2) ON CONFLICT DO NOTHING', [from, to]);
                     await pool.query('INSERT INTO contacts (user_phone, contact_phone) VALUES ($1, $2) ON CONFLICT DO NOTHING', [to, from]);
-                    console.log(`📝 [${clientId}] Контакт сохранён: ${from} ↔ ${to}`);
                 }
                 const recipient = clients.get(to);
-                if (recipient) {
-                    recipient.send(JSON.stringify({ type: 'create_chat', from, fromName: from, to }));
-                }
+                if (recipient) recipient.send(JSON.stringify({ type: 'create_chat', from, fromName: from, to }));
                 ws.send(JSON.stringify({ type: 'chat_created', success: true }));
             }
-
-            // ========== СОЗДАНИЕ ГРУППЫ ==========
             else if (msg.type === 'create_group') {
                 const { name, avatar, members } = msg;
                 if (!name || !members || !Array.isArray(members) || members.length === 0) {
@@ -353,19 +325,12 @@ wss.on('connection', (ws) => {
                 const group = { id: groupId, name, avatar: avatar || '👥', type: 'group' };
                 for (const member of allMembers) {
                     const client = clients.get(member);
-                    if (client) {
-                        client.send(JSON.stringify({ type: 'group_created', group }));
-                    }
+                    if (client) client.send(JSON.stringify({ type: 'group_created', group }));
                 }
                 ws.send(JSON.stringify({ type: 'group_created', group }));
             }
-
-            // ========== ПОЛУЧЕНИЕ СПИСКА ЧАТОВ (КОНТАКТЫ + ГРУППЫ) ==========
             else if (msg.type === 'get_contacts') {
-                if (!userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
-                    return;
-                }
+                if (!userPhone) return;
                 const contactsRes = await pool.query('SELECT contact_phone FROM contacts WHERE user_phone = $1', [userPhone]);
                 const contacts = contactsRes.rows.map(r => r.contact_phone);
                 const groupsRes = await pool.query(`
@@ -377,15 +342,9 @@ wss.on('connection', (ws) => {
                 const groups = groupsRes.rows;
                 ws.send(JSON.stringify({ type: 'contacts_list', contacts, groups }));
             }
-
-            // ========== ПОЛУЧЕНИЕ УЧАСТНИКОВ ГРУППЫ ==========
             else if (msg.type === 'get_group_members') {
                 const { groupId } = msg;
-                if (!groupId) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан groupId' }));
-                    return;
-                }
-                // Проверяем, состоит ли пользователь в группе
+                if (!groupId) return;
                 const memberCheck = await pool.query('SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
                 if (memberCheck.rows.length === 0) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Вы не состоите в этой группе' }));
@@ -399,162 +358,35 @@ wss.on('connection', (ws) => {
                     ORDER BY gm.joined_at
                 `, [groupId]);
                 const members = membersRes.rows;
-                const memberCount = members.length;
-                ws.send(JSON.stringify({ type: 'group_members_list', groupId, members, memberCount }));
+                ws.send(JSON.stringify({ type: 'group_members_list', groupId, members, memberCount: members.length }));
             }
-
-            // ========== ВЫХОД ИЗ ГРУППЫ ==========
-            else if (msg.type === 'leave_group') {
-                const { groupId } = msg;
-                if (!groupId || !userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан groupId' }));
+            // ========== УДАЛЕНИЕ СООБЩЕНИЯ ==========
+            else if (msg.type === 'delete_message') {
+                const { messageId, from, to, groupId } = msg;
+                if (!messageId || !from) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан ID сообщения или отправитель' }));
                     return;
                 }
-                // Проверяем, состоит ли пользователь
-                const memberCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
-                if (memberCheck.rows.length === 0) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Вы не состоите в этой группе' }));
+                const msgCheck = await pool.query('SELECT from_phone FROM messages WHERE id = $1', [messageId]);
+                if (msgCheck.rows.length === 0 || msgCheck.rows[0].from_phone !== from) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав для удаления сообщения' }));
                     return;
                 }
-                // Удаляем участника
-                await pool.query('DELETE FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
-
-                // Проверяем, остались ли участники
-                const remaining = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
-                if (remaining.rows.length === 0) {
-                    // Удаляем группу
-                    await pool.query('DELETE FROM groups WHERE id = $1', [groupId]);
-                    // Оповещать некого
-                    ws.send(JSON.stringify({ type: 'group_deleted', groupId }));
-                } else {
-                    // Если вышел создатель, назначаем нового админа (первого попавшегося)
-                    const groupInfo = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
-                    if (groupInfo.rows[0].created_by === userPhone) {
-                        const newAdmin = remaining.rows[0].user_phone;
-                        await pool.query('UPDATE groups SET created_by = $1 WHERE id = $2', [newAdmin, groupId]);
-                        await pool.query('UPDATE group_members SET role = $1 WHERE group_id = $2 AND user_phone = $3', ['admin', groupId, newAdmin]);
-                    }
-                    // Оповещаем оставшихся участников
-                    const notification = {
-                        type: 'group_member_removed',
-                        groupId,
-                        removedMember: userPhone
-                    };
-                    for (const row of remaining.rows) {
-                        const client = clients.get(row.user_phone);
-                        if (client) client.send(JSON.stringify(notification));
-                    }
-                    ws.send(JSON.stringify({ type: 'group_left', groupId }));
-                }
-                console.log(`🚪 ${userPhone} покинул группу ${groupId}`);
-            }
-
-            // ========== ДОБАВЛЕНИЕ УЧАСТНИКОВ В ГРУППУ ==========
-            else if (msg.type === 'add_group_members') {
-                const { groupId, members } = msg;
-                if (!groupId || !members || !Array.isArray(members) || members.length === 0) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не указаны группа или участники' }));
-                    return;
-                }
-                // Проверяем, что пользователь админ
-                const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
-                if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
-                    return;
-                }
-                const added = [];
-                for (const phone of members) {
-                    // Проверяем существование пользователя
-                    const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [phone]);
-                    if (userExists.rows.length === 0) continue;
-                    // Добавляем, если ещё не в группе
-                    try {
-                        await pool.query('INSERT INTO group_members (group_id, user_phone, role) VALUES ($1, $2, $3)',
-                            [groupId, phone, 'member']);
-                        added.push(phone);
-                    } catch (e) {
-                        // Уже в группе
+                await pool.query('DELETE FROM messages WHERE id = $1', [messageId]);
+                // Оповещаем участников
+                if (to) {
+                    const recipientWs = clients.get(to);
+                    if (recipientWs) recipientWs.send(JSON.stringify({ type: 'message_deleted', messageId, to }));
+                    ws.send(JSON.stringify({ type: 'message_deleted', messageId }));
+                } else if (groupId) {
+                    const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
+                    for (const member of membersRes.rows) {
+                        const memberWs = clients.get(member.user_phone);
+                        if (memberWs) memberWs.send(JSON.stringify({ type: 'message_deleted', messageId, groupId }));
                     }
                 }
-                if (added.length > 0) {
-                    const notification = {
-                        type: 'group_members_added',
-                        groupId,
-                        addedMembers: added
-                    };
-                    // Оповещаем всех участников
-                    const allMembers = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
-                    for (const row of allMembers.rows) {
-                        const client = clients.get(row.user_phone);
-                        if (client) client.send(JSON.stringify(notification));
-                    }
-                }
-                ws.send(JSON.stringify({ type: 'group_members_added', groupId, addedMembers: added }));
+                console.log(`🗑️ Сообщение ${messageId} удалено`);
             }
-
-            // ========== УДАЛЕНИЕ УЧАСТНИКА ИЗ ГРУППЫ ==========
-            else if (msg.type === 'remove_group_member') {
-                const { groupId, member } = msg;
-                if (!groupId || !member) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не указана группа или участник' }));
-                    return;
-                }
-                // Проверяем права
-                const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
-                if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
-                    return;
-                }
-                // Нельзя удалить создателя? По логике можно, но тогда группа останется без админа. Пока разрешим.
-                await pool.query('DELETE FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, member]);
-
-                const remaining = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
-                if (remaining.rows.length === 0) {
-                    await pool.query('DELETE FROM groups WHERE id = $1', [groupId]);
-                    ws.send(JSON.stringify({ type: 'group_deleted', groupId }));
-                } else {
-                    const notification = {
-                        type: 'group_member_removed',
-                        groupId,
-                        removedMember: member
-                    };
-                    for (const row of remaining.rows) {
-                        const client = clients.get(row.user_phone);
-                        if (client) client.send(JSON.stringify(notification));
-                    }
-                    // Уведомляем удалённого
-                    const removedClient = clients.get(member);
-                    if (removedClient) removedClient.send(JSON.stringify({ type: 'group_left', groupId }));
-                    ws.send(JSON.stringify({ type: 'group_member_removed', groupId, removedMember: member }));
-                }
-            }
-
-            // ========== УДАЛЕНИЕ ГРУППЫ (ТОЛЬКО СОЗДАТЕЛЬ) ==========
-            else if (msg.type === 'delete_group') {
-                const { groupId } = msg;
-                if (!groupId || !userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан groupId' }));
-                    return;
-                }
-                const groupCheck = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
-                if (groupCheck.rows.length === 0) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Группа не найдена' }));
-                    return;
-                }
-                if (groupCheck.rows[0].created_by !== userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Только создатель может удалить группу' }));
-                    return;
-                }
-                const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
-                await pool.query('DELETE FROM groups WHERE id = $1', [groupId]);
-                for (const member of membersRes.rows) {
-                    const memberWs = clients.get(member.user_phone);
-                    if (memberWs) memberWs.send(JSON.stringify({ type: 'group_deleted', groupId }));
-                }
-                ws.send(JSON.stringify({ type: 'group_deleted', groupId }));
-                console.log(`🗑️ Группа ${groupId} удалена создателем ${userPhone}`);
-            }
-
             // ========== ОТПРАВКА СООБЩЕНИЯ ==========
             else if (msg.type === 'chat_message') {
                 const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType, repliedTo } = msg;
@@ -621,20 +453,14 @@ wss.on('connection', (ws) => {
                                 isVoice ? '🎤 Голосовое' : (isFile ? `📎 ${fileName}` : content), {});
                         }
                     }
-                    if (deliveredCount > 0) {
-                        await pool.query('UPDATE messages SET delivered = true WHERE id = $1', [id]);
-                    }
+                    if (deliveredCount > 0) await pool.query('UPDATE messages SET delivered = true WHERE id = $1', [id]);
                     ws.send(JSON.stringify({ type: 'message_delivered', messageId: id, groupId }));
                 }
                 console.log(`✅ Сообщение ${id} от ${from}`);
             }
-
-            // ========== ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ ==========
+            // ========== ИСТОРИЯ СООБЩЕНИЙ ==========
             else if (msg.type === 'get_personal_messages') {
-                if (!userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
-                    return;
-                }
+                if (!userPhone) return;
                 try {
                     const limit = msg.limit || 50;
                     const offset = msg.offset || 0;
@@ -650,20 +476,13 @@ wss.on('connection', (ws) => {
                          LIMIT $2 OFFSET $3`,
                         [userPhone, limit, offset]
                     );
-                    const messages = result.rows.reverse();
-                    ws.send(JSON.stringify({ type: 'personal_messages_history', messages }));
+                    ws.send(JSON.stringify({ type: 'personal_messages_history', messages: result.rows.reverse() }));
                 } catch (err) {
-                    console.error('Ошибка получения личных сообщений:', err);
-                    ws.send(JSON.stringify({ type: 'error', error: 'Ошибка получения сообщений: ' + err.message }));
+                    ws.send(JSON.stringify({ type: 'error', error: 'Ошибка получения сообщений' }));
                 }
             }
-
-            // ========== ПОЛУЧЕНИЕ ГРУППОВОЙ ИСТОРИИ ==========
             else if (msg.type === 'get_group_messages') {
-                if (!userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
-                    return;
-                }
+                if (!userPhone) return;
                 try {
                     const limit = msg.limit || 50;
                     const offset = msg.offset || 0;
@@ -679,15 +498,12 @@ wss.on('connection', (ws) => {
                          LIMIT $2 OFFSET $3`,
                         [userPhone, limit, offset]
                     );
-                    const messages = result.rows.reverse();
-                    ws.send(JSON.stringify({ type: 'group_messages_history', messages }));
+                    ws.send(JSON.stringify({ type: 'group_messages_history', messages: result.rows.reverse() }));
                 } catch (err) {
-                    console.error('Ошибка получения групповых сообщений:', err);
-                    ws.send(JSON.stringify({ type: 'error', error: 'Ошибка получения сообщений: ' + err.message }));
+                    ws.send(JSON.stringify({ type: 'error', error: 'Ошибка получения сообщений' }));
                 }
             }
-
-            // ========== ЗАКРЕПЛЕНИЕ / ОТКРЕПЛЕНИЕ / ПОЛУЧЕНИЕ ЗАКРЕПЛЁННОГО ==========
+            // ========== ЗАКРЕПЛЕНИЯ ==========
             else if (msg.type === 'pin_message') {
                 const { messageId, chatId } = msg;
                 const clientChatId = chatId;
@@ -713,30 +529,24 @@ wss.on('connection', (ws) => {
 
                 if (message.group_id) {
                     if (message.group_id !== clientChatId) {
-                        ws.send(JSON.stringify({ type: 'error', error: 'chatId не соответствует group_id сообщения' }));
+                        ws.send(JSON.stringify({ type: 'error', error: 'chatId не соответствует group_id' }));
                         return;
                     }
                     canonicalChatId = message.group_id;
-                    const memberCheck = await pool.query(
-                        'SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2',
-                        [canonicalChatId, userPhone]
-                    );
+                    const memberCheck = await pool.query('SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2', [canonicalChatId, userPhone]);
                     hasAccess = memberCheck.rows.length > 0;
                 } else {
-                    const participant1 = message.from_phone;
-                    const participant2 = message.to_phone;
-                    if (!participant1 || !participant2) {
-                        ws.send(JSON.stringify({ type: 'error', error: 'Не удалось определить участников чата' }));
+                    const p1 = message.from_phone, p2 = message.to_phone;
+                    if (!p1 || !p2) {
+                        ws.send(JSON.stringify({ type: 'error', error: 'Не удалось определить участников' }));
                         return;
                     }
-                    canonicalChatId = getCanonicalPrivateChatId(participant1, participant2);
-                    if (participant1 === userPhone || participant2 === userPhone) {
-                        hasAccess = true;
-                    }
+                    canonicalChatId = getCanonicalPrivateChatId(p1, p2);
+                    hasAccess = (p1 === userPhone || p2 === userPhone);
                 }
 
                 if (!hasAccess) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Нет доступа к этому чату' }));
+                    ws.send(JSON.stringify({ type: 'error', error: 'Нет доступа' }));
                     return;
                 }
 
@@ -768,115 +578,74 @@ wss.on('connection', (ws) => {
                 };
 
                 if (!message.group_id) {
-                    const otherPhone = message.from_phone === userPhone ? message.to_phone : message.from_phone;
-                    const otherWs = clients.get(otherPhone);
+                    const other = message.from_phone === userPhone ? message.to_phone : message.from_phone;
+                    const otherWs = clients.get(other);
                     if (otherWs) otherWs.send(JSON.stringify(pinNotification));
                     ws.send(JSON.stringify(pinNotification));
                 } else {
-                    const membersRes = await pool.query(
-                        'SELECT user_phone FROM group_members WHERE group_id = $1',
-                        [canonicalChatId]
-                    );
+                    const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [canonicalChatId]);
                     for (const member of membersRes.rows) {
                         const memberWs = clients.get(member.user_phone);
                         if (memberWs) memberWs.send(JSON.stringify(pinNotification));
                     }
                 }
-
-                console.log(`📌 Сообщение ${messageId} закреплено в чате ${canonicalChatId} пользователем ${userPhone}`);
+                console.log(`📌 Закреплено в ${canonicalChatId}`);
             }
-
             else if (msg.type === 'unpin_message') {
                 const { chatId } = msg;
                 const clientChatId = chatId;
-                if (!clientChatId || !userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан chatId' }));
-                    return;
-                }
+                if (!clientChatId || !userPhone) return;
 
                 let canonicalChatId;
                 let hasAccess = false;
-
                 const groupCheck = await pool.query('SELECT id FROM groups WHERE id = $1', [clientChatId]);
                 if (groupCheck.rows.length > 0) {
                     canonicalChatId = clientChatId;
-                    const memberCheck = await pool.query(
-                        'SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2',
-                        [canonicalChatId, userPhone]
-                    );
+                    const memberCheck = await pool.query('SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2', [canonicalChatId, userPhone]);
                     hasAccess = memberCheck.rows.length > 0;
                 } else {
-                    const otherPhone = clientChatId;
-                    canonicalChatId = getCanonicalPrivateChatId(userPhone, otherPhone);
-                    const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [otherPhone]);
+                    const other = clientChatId;
+                    canonicalChatId = getCanonicalPrivateChatId(userPhone, other);
+                    const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [other]);
                     hasAccess = userExists.rows.length > 0;
                 }
-
-                if (!hasAccess) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Нет доступа к этому чату' }));
-                    return;
-                }
+                if (!hasAccess) return;
 
                 await pool.query('DELETE FROM pinned_messages WHERE chat_id = $1', [canonicalChatId]);
 
-                const unpinNotification = {
-                    type: 'unpin_message',
-                    chatId: clientChatId,
-                    by: userPhone
-                };
-
+                const unpinNotification = { type: 'unpin_message', chatId: clientChatId, by: userPhone };
                 if (groupCheck.rows.length === 0) {
-                    const otherPhone = clientChatId;
-                    const otherWs = clients.get(otherPhone);
+                    const other = clientChatId;
+                    const otherWs = clients.get(other);
                     if (otherWs) otherWs.send(JSON.stringify(unpinNotification));
                     ws.send(JSON.stringify(unpinNotification));
                 } else {
-                    const membersRes = await pool.query(
-                        'SELECT user_phone FROM group_members WHERE group_id = $1',
-                        [canonicalChatId]
-                    );
+                    const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [canonicalChatId]);
                     for (const member of membersRes.rows) {
                         const memberWs = clients.get(member.user_phone);
                         if (memberWs) memberWs.send(JSON.stringify(unpinNotification));
                     }
                 }
-
-                console.log(`📌 Закрепление в чате ${canonicalChatId} снято пользователем ${userPhone}`);
             }
-
             else if (msg.type === 'get_pinned_message') {
-                if (!userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
-                    return;
-                }
+                if (!userPhone) return;
                 const clientChatId = msg.chatId;
-                if (!clientChatId) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан chatId' }));
-                    return;
-                }
+                if (!clientChatId) return;
 
                 let canonicalChatId;
                 let hasAccess = false;
-
                 const groupCheck = await pool.query('SELECT id FROM groups WHERE id = $1', [clientChatId]);
                 if (groupCheck.rows.length > 0) {
                     canonicalChatId = clientChatId;
-                    const memberCheck = await pool.query(
-                        'SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2',
-                        [canonicalChatId, userPhone]
-                    );
+                    const memberCheck = await pool.query('SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2', [canonicalChatId, userPhone]);
                     hasAccess = memberCheck.rows.length > 0;
                 } else {
-                    const otherPhone = clientChatId;
-                    canonicalChatId = getCanonicalPrivateChatId(userPhone, otherPhone);
-                    const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [otherPhone]);
+                    const other = clientChatId;
+                    canonicalChatId = getCanonicalPrivateChatId(userPhone, other);
+                    const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [other]);
                     hasAccess = userExists.rows.length > 0;
                 }
-
-                if (!hasAccess) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Нет доступа к этому чату' }));
-                    return;
-                }
+                if (!hasAccess) return;
 
                 try {
                     const pinnedRes = await pool.query(
@@ -894,19 +663,199 @@ wss.on('connection', (ws) => {
                         ws.send(JSON.stringify({ type: 'pinned_message', message: null, chatId: clientChatId }));
                     }
                 } catch (err) {
-                    console.error('Ошибка получения закреплённого сообщения:', err);
                     ws.send(JSON.stringify({ type: 'error', error: 'Ошибка получения закреплённого сообщения' }));
                 }
             }
+            // ========== РЕДАКТИРОВАНИЕ ==========
+            else if (msg.type === 'edit_message') {
+                const { messageId, newContent, from, to, groupId } = msg;
+                if (!messageId || !newContent || !from) return;
+                if (from !== userPhone) return;
 
-            // ========== РЕДАКТИРОВАНИЕ / УДАЛЕНИЕ / ПРОЧТЕНИЕ ==========
-            // ... (остальные обработчики: edit_message, delete_message, read_receipt, update_profile, get_profile, call_ended, offer, answer, ice-candidate, change_password, logout, delete_account и т.д.)
-            // Для экономии места они опущены, но должны быть включены в полную версию.
+                const msgCheck = await pool.query('SELECT from_phone FROM messages WHERE id = $1', [messageId]);
+                if (msgCheck.rows.length === 0 || msgCheck.rows[0].from_phone !== from) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
+                    return;
+                }
+                await pool.query(`UPDATE messages SET content = $1, edited = true WHERE id = $2`, [newContent, messageId]);
 
-            else {
-                console.log(`⚠️ [${clientId}] Неизвестный тип сообщения: ${msg.type}`);
+                const editedMessage = { type: 'message_edited', messageId, newContent, chatId: groupId || to, from };
+                if (to) {
+                    const recipientWs = clients.get(to);
+                    if (recipientWs) recipientWs.send(JSON.stringify(editedMessage));
+                    ws.send(JSON.stringify(editedMessage));
+                } else if (groupId) {
+                    const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
+                    for (const member of membersRes.rows) {
+                        const memberWs = clients.get(member.user_phone);
+                        if (memberWs) memberWs.send(JSON.stringify(editedMessage));
+                    }
+                }
+                console.log(`✏️ Сообщение ${messageId} отредактировано`);
             }
-
+            // ========== ПРОЧТЕНИЕ ==========
+            else if (msg.type === 'read_receipt') {
+                const { messageIds, from, to, groupId } = msg;
+                if (!from || (!to && !groupId) || !messageIds) return;
+                if (from !== userPhone) return;
+                await pool.query('UPDATE messages SET read = true WHERE id = ANY($1::text[])', [messageIds]);
+                if (to) {
+                    const sender = clients.get(to);
+                    if (sender) sender.send(JSON.stringify({ type: 'message_read', messageIds, from }));
+                } else if (groupId) {
+                    const sendersRes = await pool.query(
+                        'SELECT DISTINCT from_phone FROM messages WHERE id = ANY($1::text[]) AND group_id = $2',
+                        [messageIds, groupId]
+                    );
+                    for (const row of sendersRes.rows) {
+                        const senderWs = clients.get(row.from_phone);
+                        if (senderWs) senderWs.send(JSON.stringify({ type: 'message_read', messageIds, from }));
+                    }
+                }
+            }
+            // ========== УПРАВЛЕНИЕ ГРУППОЙ ==========
+            else if (msg.type === 'leave_group') {
+                const { groupId } = msg;
+                if (!groupId || !userPhone) return;
+                await pool.query('DELETE FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
+                const remaining = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
+                if (remaining.rows.length === 0) {
+                    await pool.query('DELETE FROM groups WHERE id = $1', [groupId]);
+                    ws.send(JSON.stringify({ type: 'group_deleted', groupId }));
+                } else {
+                    const groupInfo = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
+                    if (groupInfo.rows[0].created_by === userPhone) {
+                        const newAdmin = remaining.rows[0].user_phone;
+                        await pool.query('UPDATE groups SET created_by = $1 WHERE id = $2', [newAdmin, groupId]);
+                        await pool.query('UPDATE group_members SET role = $1 WHERE group_id = $2 AND user_phone = $3', ['admin', groupId, newAdmin]);
+                    }
+                    const notification = { type: 'group_member_removed', groupId, removedMember: userPhone };
+                    for (const row of remaining.rows) {
+                        const client = clients.get(row.user_phone);
+                        if (client) client.send(JSON.stringify(notification));
+                    }
+                    ws.send(JSON.stringify({ type: 'group_left', groupId }));
+                }
+                console.log(`🚪 ${userPhone} покинул группу ${groupId}`);
+            }
+            else if (msg.type === 'add_group_members') {
+                const { groupId, members } = msg;
+                if (!groupId || !members || !Array.isArray(members)) return;
+                const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
+                if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
+                    return;
+                }
+                const added = [];
+                for (const phone of members) {
+                    try {
+                        await pool.query('INSERT INTO group_members (group_id, user_phone, role) VALUES ($1, $2, $3)', [groupId, phone, 'member']);
+                        added.push(phone);
+                    } catch (e) {}
+                }
+                if (added.length > 0) {
+                    const notification = { type: 'group_members_added', groupId, addedMembers: added };
+                    const allMembers = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
+                    for (const row of allMembers.rows) {
+                        const client = clients.get(row.user_phone);
+                        if (client) client.send(JSON.stringify(notification));
+                    }
+                }
+                ws.send(JSON.stringify({ type: 'group_members_added', groupId, addedMembers: added }));
+            }
+            else if (msg.type === 'remove_group_member') {
+                const { groupId, member } = msg;
+                if (!groupId || !member) return;
+                const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
+                if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
+                    return;
+                }
+                await pool.query('DELETE FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, member]);
+                const remaining = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
+                if (remaining.rows.length === 0) {
+                    await pool.query('DELETE FROM groups WHERE id = $1', [groupId]);
+                    ws.send(JSON.stringify({ type: 'group_deleted', groupId }));
+                } else {
+                    const notification = { type: 'group_member_removed', groupId, removedMember: member };
+                    for (const row of remaining.rows) {
+                        const client = clients.get(row.user_phone);
+                        if (client) client.send(JSON.stringify(notification));
+                    }
+                    const removedClient = clients.get(member);
+                    if (removedClient) removedClient.send(JSON.stringify({ type: 'group_left', groupId }));
+                    ws.send(JSON.stringify({ type: 'group_member_removed', groupId, removedMember: member }));
+                }
+            }
+            else if (msg.type === 'delete_group') {
+                const { groupId } = msg;
+                if (!groupId || !userPhone) return;
+                const groupCheck = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
+                if (groupCheck.rows.length === 0) return;
+                if (groupCheck.rows[0].created_by !== userPhone) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Только создатель может удалить группу' }));
+                    return;
+                }
+                const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
+                await pool.query('DELETE FROM groups WHERE id = $1', [groupId]);
+                for (const member of membersRes.rows) {
+                    const memberWs = clients.get(member.user_phone);
+                    if (memberWs) memberWs.send(JSON.stringify({ type: 'group_deleted', groupId }));
+                }
+                ws.send(JSON.stringify({ type: 'group_deleted', groupId }));
+            }
+            // ========== УДАЛЕНИЕ ЧАТА ==========
+            else if (msg.type === 'delete_chat') {
+                const { chatId, with: withPhone } = msg;
+                if (!chatId || !userPhone) return;
+                await pool.query('DELETE FROM messages WHERE (from_phone = $1 AND to_phone = $2) OR (from_phone = $2 AND to_phone = $1)', [userPhone, withPhone]);
+                await pool.query('DELETE FROM contacts WHERE (user_phone = $1 AND contact_phone = $2) OR (user_phone = $2 AND contact_phone = $1)', [userPhone, withPhone]);
+                const canonical = getCanonicalPrivateChatId(userPhone, withPhone);
+                await pool.query('DELETE FROM pinned_messages WHERE chat_id = $1', [canonical]);
+                const otherWs = clients.get(withPhone);
+                if (otherWs) otherWs.send(JSON.stringify({ type: 'chat_deleted', chatId: canonical }));
+                ws.send(JSON.stringify({ type: 'chat_deleted', chatId: canonical }));
+            }
+            // ========== WEBRTC / ПРОФИЛЬ / ПАРОЛЬ / ВЫХОД (кратко) ==========
+            else if (['offer', 'answer', 'ice-candidate', 'call_ended'].includes(msg.type)) {
+                const recipient = clients.get(msg.to);
+                if (recipient) recipient.send(JSON.stringify(msg));
+                else if (msg.type === 'offer') {
+                    await sendFCMNotification(msg.to, 'Входящий звонок', `Звонок от ${msg.fromName || msg.from}`, { type: 'call', from: msg.from });
+                }
+            }
+            else if (msg.type === 'update_profile') {
+                const { user } = msg;
+                if (!user || user.phone !== userPhone) return;
+                const fields = [], values = [];
+                let idx = 1;
+                if (user.name) { fields.push(`name = $${idx++}`); values.push(user.name); }
+                if (user.avatar) { fields.push(`avatar = $${idx++}`); values.push(user.avatar); }
+                if (user.status) { fields.push(`status = $${idx++}`); values.push(user.status); }
+                if (user.email) { fields.push(`email = $${idx++}`); values.push(user.email); }
+                if (user.settings) { fields.push(`settings = $${idx++}`); values.push(JSON.stringify(user.settings)); }
+                if (fields.length) {
+                    values.push(user.phone);
+                    await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE phone = $${idx}`, values);
+                }
+            }
+            else if (msg.type === 'get_profile') {
+                const phone = msg.phone || userPhone;
+                const result = await pool.query('SELECT phone, name, avatar, status, email, settings, last_seen FROM users WHERE phone = $1', [phone]);
+                if (result.rows.length > 0) ws.send(JSON.stringify({ type: 'profile_data', user: result.rows[0] }));
+            }
+            else if (msg.type === 'change_password') {
+                if (!userPhone || msg.phone !== userPhone) return;
+                await pool.query('UPDATE users SET password = $1 WHERE phone = $2', [msg.newPassword, msg.phone]);
+                ws.send(JSON.stringify({ type: 'password_changed' }));
+            }
+            else if (msg.type === 'logout') {
+                if (msg.token) await pool.query('DELETE FROM sessions WHERE token = $1', [msg.token]);
+                ws.send(JSON.stringify({ type: 'logout_success' }));
+            }
+            else {
+                console.log(`⚠️ Неизвестный тип: ${msg.type}`);
+            }
         } catch (err) {
             console.error(`❌ [${clientId}] Ошибка:`, err);
             ws.send(JSON.stringify({ type: 'error', error: err.message }));
@@ -920,11 +869,9 @@ wss.on('connection', (ws) => {
         }
         console.log(`🔴 [${clientId}] Отключился`);
     });
-
     ws.on('error', (err) => console.error(`⚠️ [${clientId}] Ошибка сокета:`, err.message));
 });
 
-// ========== PING ==========
 setInterval(() => {
     wss.clients.forEach(ws => {
         if (ws.isAlive === false) return ws.terminate();
