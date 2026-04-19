@@ -715,11 +715,12 @@ wss.on('connection', (ws) => {
                             fileName, fileSize, fileType, repliedTo
                         }));
                         await pool.query('UPDATE messages SET delivered = true WHERE id = $1', [id]);
+                        // Отправляем подтверждение доставки отправителю
+                        ws.send(JSON.stringify({ type: 'message_delivered', messageId: id, to }));
                     } else {
                         await sendFCMNotification(to, fromName || from,
                             isVoice ? '🎤 Голосовое' : (isFile ? `📎 ${fileName}` : content), {});
                     }
-                    ws.send(JSON.stringify({ type: 'message_delivered', messageId: id, to }));
                 } else if (groupId) {
                     const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
                     let deliveredCount = 0;
@@ -745,6 +746,54 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'message_delivered', messageId: id, groupId }));
                 }
                 console.log(`✅ Сообщение ${id} от ${from}`);
+            }
+
+            // ---------- ПОДТВЕРЖДЕНИЕ ДОСТАВКИ СООБЩЕНИЙ (МАССОВОЕ) ----------
+            else if (msg.type === 'mark_delivered') {
+                const { messageIds } = msg;
+                if (!messageIds || !Array.isArray(messageIds) || messageIds.length === 0) return;
+                if (!userPhone) return;
+
+                try {
+                    // Обновляем статус delivered для указанных сообщений
+                    await pool.query(
+                        'UPDATE messages SET delivered = true WHERE id = ANY($1::text[]) AND delivered = false',
+                        [messageIds]
+                    );
+
+                    // Находим отправителей этих сообщений, исключая самого получателя
+                    const sendersRes = await pool.query(
+                        `SELECT DISTINCT from_phone, to_phone, group_id FROM messages 
+                         WHERE id = ANY($1::text[]) AND from_phone != $2`,
+                        [messageIds, userPhone]
+                    );
+
+                    // Группируем по отправителям
+                    const senderMessages = {};
+                    for (const row of sendersRes.rows) {
+                        const sender = row.from_phone;
+                        if (!senderMessages[sender]) senderMessages[sender] = [];
+                        senderMessages[sender].push(row);
+                    }
+
+                    // Отправляем уведомления о доставке каждому отправителю онлайн
+                    for (const sender in senderMessages) {
+                        const senderWs = clients.get(sender);
+                        if (senderWs) {
+                            const idsForSender = senderMessages[sender].map(r => r.id);
+                            senderWs.send(JSON.stringify({
+                                type: 'message_delivered',
+                                messageIds: idsForSender,
+                                from: userPhone // кто подтвердил доставку
+                            }));
+                        }
+                    }
+
+                    console.log(`✅ Доставка подтверждена для ${messageIds.length} сообщений от ${userPhone}`);
+                } catch (err) {
+                    console.error('Ошибка при mark_delivered:', err);
+                    ws.send(JSON.stringify({ type: 'error', error: 'Ошибка подтверждения доставки' }));
+                }
             }
 
             // ---------- ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ ----------
