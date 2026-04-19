@@ -136,7 +136,7 @@ async function initDatabase() {
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT`);
     } catch (e) {}
 
-    // Изменение типа колонки avatar на TEXT для уже существующих таблиц (если они были созданы ранее с VARCHAR)
+    // Изменяем тип avatar на TEXT, если таблицы уже существовали с VARCHAR
     try {
         await pool.query(`ALTER TABLE users ALTER COLUMN avatar TYPE TEXT`);
     } catch (e) {}
@@ -155,6 +155,10 @@ async function initDatabase() {
 
     console.log('✅ База данных инициализирована');
 }
+initDatabase().catch(console.error);
+
+// ========== ГЛОБАЛЬНОЕ ХРАНИЛИЩЕ АКТИВНЫХ СОЕДИНЕНИЙ ==========
+const clients = new Map();
 
 // ========== HTTP + WEBSOCKET ==========
 const wss = new WebSocket.Server({ noServer: true });
@@ -619,14 +623,13 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
                     return;
                 }
-                // Получаем контакты с именами и аватарками
                 const contactsRes = await pool.query(`
                     SELECT u.phone, u.name, u.avatar
                     FROM contacts c
                     JOIN users u ON c.contact_phone = u.phone
                     WHERE c.user_phone = $1
                 `, [userPhone]);
-                const contacts = contactsRes.rows; // массив объектов {phone, name, avatar}
+                const contacts = contactsRes.rows;
 
                 const groupsRes = await pool.query(`
                     SELECT g.id, g.name, g.avatar,
@@ -642,7 +645,6 @@ wss.on('connection', (ws) => {
                     memberCount: parseInt(r.member_count)
                 }));
 
-                // Закреплённые чаты
                 const pinnedRes = await pool.query(
                     'SELECT chat_id FROM pinned_chats WHERE user_phone = $1',
                     [userPhone]
@@ -1254,8 +1256,6 @@ wss.on('connection', (ws) => {
             // ---------- УДАЛЕНИЕ АККАУНТА ----------
             else if (msg.type === 'delete_account') {
                 if (!userPhone) return;
-                // Каскадное удаление произойдёт автоматически благодаря внешним ключам с ON DELETE CASCADE
-                // Но contacts нужно удалить вручную, так как там два внешних ключа на одну таблицу
                 await pool.query('DELETE FROM contacts WHERE user_phone = $1 OR contact_phone = $1', [userPhone]);
                 await pool.query('DELETE FROM users WHERE phone = $1', [userPhone]);
                 ws.send(JSON.stringify({ type: 'account_deleted' }));
