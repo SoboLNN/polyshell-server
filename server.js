@@ -96,6 +96,15 @@ async function initDatabase() {
             PRIMARY KEY (chat_id)
         )
     `);
+    // Новая таблица для закреплённых чатов
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pinned_chats (
+            user_phone VARCHAR(20) NOT NULL REFERENCES users(phone) ON DELETE CASCADE,
+            chat_id TEXT NOT NULL,
+            pinned_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (user_phone, chat_id)
+        )
+    `);
 
     const addColumnIfNotExists = async (table, column, definition) => {
         try {
@@ -595,14 +604,21 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'group_member_demoted', groupId, member }));
             }
 
-            // ---------- ПОЛУЧЕНИЕ СПИСКА ЧАТОВ (КОНТАКТЫ + ГРУППЫ) ----------
+            // ---------- ПОЛУЧЕНИЕ СПИСКА ЧАТОВ (КОНТАКТЫ + ГРУППЫ) + ЗАКРЕПЛЁННЫЕ ЧАТЫ ----------
             else if (msg.type === 'get_contacts') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
                     return;
                 }
-                const contactsRes = await pool.query('SELECT contact_phone FROM contacts WHERE user_phone = $1', [userPhone]);
-                const contacts = contactsRes.rows.map(r => r.contact_phone);
+                // Получаем контакты с именами и аватарками
+                const contactsRes = await pool.query(`
+                    SELECT u.phone, u.name, u.avatar
+                    FROM contacts c
+                    JOIN users u ON c.contact_phone = u.phone
+                    WHERE c.user_phone = $1
+                `, [userPhone]);
+                const contacts = contactsRes.rows; // массив объектов {phone, name, avatar}
+
                 const groupsRes = await pool.query(`
                     SELECT g.id, g.name, g.avatar,
                            (SELECT COUNT(*) FROM group_members WHERE group_id = g.id) as member_count
@@ -616,7 +632,45 @@ wss.on('connection', (ws) => {
                     avatar: r.avatar,
                     memberCount: parseInt(r.member_count)
                 }));
-                ws.send(JSON.stringify({ type: 'contacts_list', contacts, groups }));
+
+                // Закреплённые чаты
+                const pinnedRes = await pool.query(
+                    'SELECT chat_id FROM pinned_chats WHERE user_phone = $1',
+                    [userPhone]
+                );
+                const pinnedChatIds = pinnedRes.rows.map(r => r.chat_id);
+
+                ws.send(JSON.stringify({ type: 'contacts_list', contacts, groups, pinnedChatIds }));
+            }
+
+            // ---------- ЗАКРЕПЛЕНИЕ / ОТКРЕПЛЕНИЕ ЧАТОВ ----------
+            else if (msg.type === 'pin_chat') {
+                const { chatId } = msg;
+                if (!chatId) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан chatId' }));
+                    return;
+                }
+                await pool.query(
+                    `INSERT INTO pinned_chats (user_phone, chat_id) VALUES ($1, $2)
+                     ON CONFLICT (user_phone, chat_id) DO NOTHING`,
+                    [userPhone, chatId]
+                );
+                ws.send(JSON.stringify({ type: 'chat_pinned', chatId }));
+                console.log(`📌 Чат ${chatId} закреплён пользователем ${userPhone}`);
+            }
+            else if (msg.type === 'unpin_chat') {
+                const { chatId } = msg;
+                if (!chatId) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Не указан chatId' }));
+                    return;
+                }
+                await pool.query('DELETE FROM pinned_chats WHERE user_phone = $1 AND chat_id = $2', [userPhone, chatId]);
+                ws.send(JSON.stringify({ type: 'chat_unpinned', chatId }));
+                console.log(`📌 Закрепление чата ${chatId} снято пользователем ${userPhone}`);
+            }
+            else if (msg.type === 'get_pinned_chats') {
+                const pinnedRes = await pool.query('SELECT chat_id FROM pinned_chats WHERE user_phone = $1', [userPhone]);
+                ws.send(JSON.stringify({ type: 'pinned_chats', chatIds: pinnedRes.rows.map(r => r.chat_id) }));
             }
 
             // ---------- ОТПРАВКА СООБЩЕНИЯ ----------
@@ -751,7 +805,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ЗАКРЕПЛЕНИЕ / ОТКРЕПЛЕНИЕ / ПОЛУЧЕНИЕ ЗАКРЕПЛЁННОГО ----------
+            // ---------- ЗАКРЕПЛЕНИЕ / ОТКРЕПЛЕНИЕ / ПОЛУЧЕНИЕ ЗАКРЕПЛЁННОГО СООБЩЕНИЯ ----------
             else if (msg.type === 'pin_message') {
                 const { messageId, chatId } = msg;
                 const clientChatId = chatId;
