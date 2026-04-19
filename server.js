@@ -32,6 +32,7 @@ const pool = new Pool({
 
 // ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ==========
 async function initDatabase() {
+    // Таблица пользователей
     await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
             phone VARCHAR(20) PRIMARY KEY,
@@ -45,23 +46,29 @@ async function initDatabase() {
             last_seen TIMESTAMP DEFAULT NOW()
         )
     `);
+
+    // Контакты с каскадным удалением
     await pool.query(`
         CREATE TABLE IF NOT EXISTS contacts (
-            user_phone VARCHAR(20) NOT NULL,
-            contact_phone VARCHAR(20) NOT NULL,
+            user_phone VARCHAR(20) NOT NULL REFERENCES users(phone) ON DELETE CASCADE,
+            contact_phone VARCHAR(20) NOT NULL REFERENCES users(phone) ON DELETE CASCADE,
             created_at TIMESTAMP DEFAULT NOW(),
             PRIMARY KEY (user_phone, contact_phone)
         )
     `);
+
+    // Группы
     await pool.query(`
         CREATE TABLE IF NOT EXISTS groups (
             id TEXT PRIMARY KEY,
             name VARCHAR(100) NOT NULL,
             avatar VARCHAR(10) DEFAULT '👥',
-            created_by VARCHAR(20) NOT NULL REFERENCES users(phone),
+            created_by VARCHAR(20) NOT NULL REFERENCES users(phone) ON DELETE CASCADE,
             created_at TIMESTAMP DEFAULT NOW()
         )
     `);
+
+    // Участники групп
     await pool.query(`
         CREATE TABLE IF NOT EXISTS group_members (
             group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
@@ -71,15 +78,30 @@ async function initDatabase() {
             PRIMARY KEY (group_id, user_phone)
         )
     `);
+
+    // Сообщения
     await pool.query(`
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
-            from_phone VARCHAR(20) NOT NULL,
-            to_phone VARCHAR(20),
+            from_phone VARCHAR(20) NOT NULL REFERENCES users(phone) ON DELETE CASCADE,
+            to_phone VARCHAR(20) REFERENCES users(phone) ON DELETE CASCADE,
+            group_id TEXT REFERENCES groups(id) ON DELETE CASCADE,
             content TEXT NOT NULL,
+            encrypted BOOLEAN DEFAULT false,
+            is_file BOOLEAN DEFAULT false,
+            is_voice BOOLEAN DEFAULT false,
+            file_name TEXT,
+            file_size BIGINT,
+            file_type TEXT,
+            delivered BOOLEAN DEFAULT false,
+            read BOOLEAN DEFAULT false,
+            replied_to TEXT,
+            edited BOOLEAN DEFAULT false,
             timestamp TIMESTAMP DEFAULT NOW()
         )
     `);
+
+    // Сессии
     await pool.query(`
         CREATE TABLE IF NOT EXISTS sessions (
             token VARCHAR(64) PRIMARY KEY,
@@ -87,16 +109,19 @@ async function initDatabase() {
             created_at TIMESTAMP DEFAULT NOW()
         )
     `);
+
+    // Закреплённые сообщения
     await pool.query(`
         CREATE TABLE IF NOT EXISTS pinned_messages (
             chat_id TEXT NOT NULL,
             message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-            pinned_by VARCHAR(20) NOT NULL REFERENCES users(phone),
+            pinned_by VARCHAR(20) NOT NULL REFERENCES users(phone) ON DELETE CASCADE,
             pinned_at TIMESTAMP DEFAULT NOW(),
             PRIMARY KEY (chat_id)
         )
     `);
-    // Новая таблица для закреплённых чатов
+
+    // Закреплённые чаты
     await pool.query(`
         CREATE TABLE IF NOT EXISTS pinned_chats (
             user_phone VARCHAR(20) NOT NULL REFERENCES users(phone) ON DELETE CASCADE,
@@ -106,32 +131,12 @@ async function initDatabase() {
         )
     `);
 
-    const addColumnIfNotExists = async (table, column, definition) => {
-        try {
-            await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
-        } catch (e) {}
-    };
-    await addColumnIfNotExists('messages', 'group_id', 'TEXT REFERENCES groups(id) ON DELETE CASCADE');
-    await addColumnIfNotExists('messages', 'encrypted', 'BOOLEAN DEFAULT false');
-    await addColumnIfNotExists('messages', 'is_file', 'BOOLEAN DEFAULT false');
-    await addColumnIfNotExists('messages', 'is_voice', 'BOOLEAN DEFAULT false');
-    await addColumnIfNotExists('messages', 'file_name', 'TEXT');
-    await addColumnIfNotExists('messages', 'file_size', 'BIGINT');
-    await addColumnIfNotExists('messages', 'file_type', 'TEXT');
-    await addColumnIfNotExists('messages', 'delivered', 'BOOLEAN DEFAULT false');
-    await addColumnIfNotExists('messages', 'read', 'BOOLEAN DEFAULT false');
-    await addColumnIfNotExists('messages', 'replied_to', 'TEXT');
-    await addColumnIfNotExists('messages', 'edited', 'BOOLEAN DEFAULT false');
-    await addColumnIfNotExists('users', 'fcm_token', 'TEXT');
-
+    // Добавление колонки fcm_token, если её нет
     try {
-        await pool.query(`ALTER TABLE messages ALTER COLUMN to_phone DROP NOT NULL`);
-    } catch (e) {}
-    try {
-        await pool.query(`ALTER TABLE messages DROP CONSTRAINT IF EXISTS target_check`);
-        await pool.query(`ALTER TABLE messages ADD CONSTRAINT target_check CHECK ((to_phone IS NOT NULL AND group_id IS NULL) OR (to_phone IS NULL AND group_id IS NOT NULL))`);
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT`);
     } catch (e) {}
 
+    // Индексы
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_from_phone ON messages(from_phone)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_to_phone ON messages(to_phone)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_group_id ON messages(group_id)`);
@@ -391,7 +396,6 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не указаны группа или участники' }));
                     return;
                 }
-                // Разрешаем добавлять любому члену группы
                 const memberCheck = await pool.query('SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
                 if (memberCheck.rows.length === 0) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Вы не состоите в этой группе' }));
@@ -715,7 +719,6 @@ wss.on('connection', (ws) => {
                             fileName, fileSize, fileType, repliedTo
                         }));
                         await pool.query('UPDATE messages SET delivered = true WHERE id = $1', [id]);
-                        // Отправляем подтверждение доставки отправителю
                         ws.send(JSON.stringify({ type: 'message_delivered', messageId: id, to }));
                     } else {
                         await sendFCMNotification(to, fromName || from,
@@ -755,20 +758,17 @@ wss.on('connection', (ws) => {
                 if (!userPhone) return;
 
                 try {
-                    // Обновляем статус delivered для указанных сообщений
                     await pool.query(
                         'UPDATE messages SET delivered = true WHERE id = ANY($1::text[]) AND delivered = false',
                         [messageIds]
                     );
 
-                    // Находим отправителей этих сообщений, исключая самого получателя
                     const sendersRes = await pool.query(
                         `SELECT DISTINCT from_phone, to_phone, group_id FROM messages 
                          WHERE id = ANY($1::text[]) AND from_phone != $2`,
                         [messageIds, userPhone]
                     );
 
-                    // Группируем по отправителям
                     const senderMessages = {};
                     for (const row of sendersRes.rows) {
                         const sender = row.from_phone;
@@ -776,7 +776,6 @@ wss.on('connection', (ws) => {
                         senderMessages[sender].push(row);
                     }
 
-                    // Отправляем уведомления о доставке каждому отправителю онлайн
                     for (const sender in senderMessages) {
                         const senderWs = clients.get(sender);
                         if (senderWs) {
@@ -784,7 +783,7 @@ wss.on('connection', (ws) => {
                             senderWs.send(JSON.stringify({
                                 type: 'message_delivered',
                                 messageIds: idsForSender,
-                                from: userPhone // кто подтвердил доставку
+                                from: userPhone
                             }));
                         }
                     }
@@ -1250,6 +1249,9 @@ wss.on('connection', (ws) => {
             // ---------- УДАЛЕНИЕ АККАУНТА ----------
             else if (msg.type === 'delete_account') {
                 if (!userPhone) return;
+                // Каскадное удаление произойдёт автоматически благодаря внешним ключам с ON DELETE CASCADE
+                // Но contacts нужно удалить вручную, так как там два внешних ключа на одну таблицу
+                await pool.query('DELETE FROM contacts WHERE user_phone = $1 OR contact_phone = $1', [userPhone]);
                 await pool.query('DELETE FROM users WHERE phone = $1', [userPhone]);
                 ws.send(JSON.stringify({ type: 'account_deleted' }));
                 console.log(`🗑️ Аккаунт ${userPhone} удалён`);
