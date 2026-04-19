@@ -38,7 +38,7 @@ async function initDatabase() {
             phone VARCHAR(20) PRIMARY KEY,
             name VARCHAR(100) NOT NULL,
             password VARCHAR(255) NOT NULL,
-            avatar VARCHAR(10) DEFAULT '👤',
+            avatar TEXT DEFAULT '👤',
             status VARCHAR(20) DEFAULT 'оффлайн',
             email VARCHAR(255),
             settings JSONB DEFAULT '{"profileVisibility":"all","lastSeenVisibility":"all","soundEnabled":true,"vibrationEnabled":true,"messagePreview":true,"theme":"system"}',
@@ -62,7 +62,7 @@ async function initDatabase() {
         CREATE TABLE IF NOT EXISTS groups (
             id TEXT PRIMARY KEY,
             name VARCHAR(100) NOT NULL,
-            avatar VARCHAR(10) DEFAULT '👥',
+            avatar TEXT DEFAULT '👥',
             created_by VARCHAR(20) NOT NULL REFERENCES users(phone) ON DELETE CASCADE,
             created_at TIMESTAMP DEFAULT NOW()
         )
@@ -136,6 +136,14 @@ async function initDatabase() {
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT`);
     } catch (e) {}
 
+    // Изменение типа колонки avatar на TEXT для уже существующих таблиц (если они были созданы ранее с VARCHAR)
+    try {
+        await pool.query(`ALTER TABLE users ALTER COLUMN avatar TYPE TEXT`);
+    } catch (e) {}
+    try {
+        await pool.query(`ALTER TABLE groups ALTER COLUMN avatar TYPE TEXT`);
+    } catch (e) {}
+
     // Индексы
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_from_phone ON messages(from_phone)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_to_phone ON messages(to_phone)`);
@@ -147,9 +155,6 @@ async function initDatabase() {
 
     console.log('✅ База данных инициализирована');
 }
-initDatabase().catch(console.error);
-
-const clients = new Map();
 
 // ========== HTTP + WEBSOCKET ==========
 const wss = new WebSocket.Server({ noServer: true });
