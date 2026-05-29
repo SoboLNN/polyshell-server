@@ -47,7 +47,6 @@ async function initDatabase() {
         )
     `);
 
-    // Контакты с каскадным удалением
     await pool.query(`
         CREATE TABLE IF NOT EXISTS contacts (
             user_phone VARCHAR(20) NOT NULL REFERENCES users(phone) ON DELETE CASCADE,
@@ -57,7 +56,6 @@ async function initDatabase() {
         )
     `);
 
-    // Группы
     await pool.query(`
         CREATE TABLE IF NOT EXISTS groups (
             id TEXT PRIMARY KEY,
@@ -68,7 +66,6 @@ async function initDatabase() {
         )
     `);
 
-    // Участники групп
     await pool.query(`
         CREATE TABLE IF NOT EXISTS group_members (
             group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
@@ -79,7 +76,7 @@ async function initDatabase() {
         )
     `);
 
-    // Сообщения
+    // Таблица сообщений с новыми полями для множественных медиа и подписи
     await pool.query(`
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
@@ -97,11 +94,13 @@ async function initDatabase() {
             read BOOLEAN DEFAULT false,
             replied_to TEXT,
             edited BOOLEAN DEFAULT false,
-            timestamp TIMESTAMP DEFAULT NOW()
+            timestamp TIMESTAMP DEFAULT NOW(),
+            is_multiple_media BOOLEAN DEFAULT false,
+            attachments JSONB,
+            caption TEXT
         )
     `);
 
-    // Сессии
     await pool.query(`
         CREATE TABLE IF NOT EXISTS sessions (
             token VARCHAR(64) PRIMARY KEY,
@@ -110,7 +109,6 @@ async function initDatabase() {
         )
     `);
 
-    // Закреплённые сообщения
     await pool.query(`
         CREATE TABLE IF NOT EXISTS pinned_messages (
             chat_id TEXT NOT NULL,
@@ -121,7 +119,6 @@ async function initDatabase() {
         )
     `);
 
-    // Закреплённые чаты
     await pool.query(`
         CREATE TABLE IF NOT EXISTS pinned_chats (
             user_phone VARCHAR(20) NOT NULL REFERENCES users(phone) ON DELETE CASCADE,
@@ -142,6 +139,17 @@ async function initDatabase() {
     } catch (e) {}
     try {
         await pool.query(`ALTER TABLE groups ALTER COLUMN avatar TYPE TEXT`);
+    } catch (e) {}
+
+    // Добавляем новые колонки в messages, если их нет (для совместимости)
+    try {
+        await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_multiple_media BOOLEAN DEFAULT FALSE`);
+    } catch (e) {}
+    try {
+        await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachments JSONB`);
+    } catch (e) {}
+    try {
+        await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS caption TEXT`);
     } catch (e) {}
 
     // Индексы
@@ -684,9 +692,9 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'pinned_chats', chatIds: pinnedRes.rows.map(r => r.chat_id) }));
             }
 
-            // ---------- ОТПРАВКА СООБЩЕНИЯ ----------
+            // ---------- ОТПРАВКА СООБЩЕНИЯ (с поддержкой множественных медиа и подписи) ----------
             else if (msg.type === 'chat_message') {
-                const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType, repliedTo } = msg;
+                const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType, repliedTo, isMultipleMedia, attachments, caption } = msg;
                 if (!from || (!to && !groupId)) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Отправитель и получатель/группа обязательны' }));
                     return;
@@ -711,9 +719,9 @@ wss.on('connection', (ws) => {
                 }
 
                 await pool.query(
-                    `INSERT INTO messages (id, from_phone, to_phone, group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp, replied_to)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-                    [id, from, to || null, groupId || null, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString(), repliedTo || null]
+                    `INSERT INTO messages (id, from_phone, to_phone, group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp, replied_to, is_multiple_media, attachments, caption)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+                    [id, from, to || null, groupId || null, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString(), repliedTo || null, isMultipleMedia || false, attachments || null, caption || null]
                 );
 
                 if (to) {
@@ -723,7 +731,10 @@ wss.on('connection', (ws) => {
                             type: 'chat_message',
                             id, from, fromName, to, content, encrypted: false, timestamp,
                             isFile: isFile || false, isVoice: isVoice || false,
-                            fileName, fileSize, fileType, repliedTo
+                            fileName, fileSize, fileType, repliedTo,
+                            isMultipleMedia: isMultipleMedia || false,
+                            attachments: attachments || null,
+                            caption: caption || null
                         }));
                         await pool.query('UPDATE messages SET delivered = true WHERE id = $1', [id]);
                         ws.send(JSON.stringify({ type: 'message_delivered', messageId: id, to }));
@@ -742,7 +753,10 @@ wss.on('connection', (ws) => {
                                 type: 'chat_message',
                                 id, from, fromName, groupId, content, encrypted: false, timestamp,
                                 isFile: isFile || false, isVoice: isVoice || false,
-                                fileName, fileSize, fileType, repliedTo
+                                fileName, fileSize, fileType, repliedTo,
+                                isMultipleMedia: isMultipleMedia || false,
+                                attachments: attachments || null,
+                                caption: caption || null
                             }));
                             deliveredCount++;
                         } else {
@@ -802,7 +816,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ ----------
+            // ---------- ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ (с новыми полями) ----------
             else if (msg.type === 'get_personal_messages') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -815,7 +829,8 @@ wss.on('connection', (ws) => {
                         `SELECT id, from_phone, to_phone, NULL as group_id,
                                 content, encrypted, is_file, is_voice,
                                 file_name, file_size, file_type,
-                                delivered, read, timestamp, replied_to, edited
+                                delivered, read, timestamp, replied_to, edited,
+                                is_multiple_media, attachments, caption
                          FROM messages
                          WHERE (from_phone = $1 OR to_phone = $1)
                            AND group_id IS NULL
@@ -831,7 +846,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ПОЛУЧЕНИЕ ГРУППОВОЙ ИСТОРИИ ----------
+            // ---------- ПОЛУЧЕНИЕ ГРУППОВОЙ ИСТОРИИ (с новыми полями) ----------
             else if (msg.type === 'get_group_messages') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -844,7 +859,8 @@ wss.on('connection', (ws) => {
                         `SELECT m.id, m.from_phone, NULL as to_phone, m.group_id,
                                 m.content, m.encrypted, m.is_file, m.is_voice,
                                 m.file_name, m.file_size, m.file_type,
-                                m.delivered, m.read, m.timestamp, m.replied_to, m.edited
+                                m.delivered, m.read, m.timestamp, m.replied_to, m.edited,
+                                m.is_multiple_media, m.attachments, m.caption
                          FROM messages m
                          INNER JOIN group_members gm ON m.group_id = gm.group_id
                          WHERE gm.user_phone = $1
