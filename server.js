@@ -32,7 +32,6 @@ const pool = new Pool({
 
 // ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ==========
 async function initDatabase() {
-    // Таблица пользователей
     await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
             phone VARCHAR(20) PRIMARY KEY,
@@ -76,7 +75,6 @@ async function initDatabase() {
         )
     `);
 
-    // Таблица сообщений с новыми полями для множественных медиа и подписи
     await pool.query(`
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
@@ -128,20 +126,15 @@ async function initDatabase() {
         )
     `);
 
-    // Добавление колонки fcm_token, если её нет
     try {
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT`);
     } catch (e) {}
-
-    // Изменяем тип avatar на TEXT, если таблицы уже существовали с VARCHAR
     try {
         await pool.query(`ALTER TABLE users ALTER COLUMN avatar TYPE TEXT`);
     } catch (e) {}
     try {
         await pool.query(`ALTER TABLE groups ALTER COLUMN avatar TYPE TEXT`);
     } catch (e) {}
-
-    // Добавляем новые колонки в messages, если их нет (для совместимости)
     try {
         await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_multiple_media BOOLEAN DEFAULT FALSE`);
     } catch (e) {}
@@ -152,7 +145,6 @@ async function initDatabase() {
         await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS caption TEXT`);
     } catch (e) {}
 
-    // Индексы
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_from_phone ON messages(from_phone)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_to_phone ON messages(to_phone)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_group_id ON messages(group_id)`);
@@ -450,7 +442,6 @@ wss.on('connection', (ws) => {
                     return;
                 }
                 if (member === userPhone) {
-                    // Выход из группы
                     await pool.query('DELETE FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
                     const remaining = await pool.query('SELECT user_phone, role FROM group_members WHERE group_id = $1', [groupId]);
                     if (remaining.rows.length === 0) {
@@ -476,7 +467,6 @@ wss.on('connection', (ws) => {
                     }
                     return;
                 }
-                // Удаление другого участника – только админ
                 const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
                 if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
                     ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
@@ -625,7 +615,7 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'group_member_demoted', groupId, member }));
             }
 
-            // ---------- ПОЛУЧЕНИЕ СПИСКА ЧАТОВ (КОНТАКТЫ + ГРУППЫ) + ЗАКРЕПЛЁННЫЕ ЧАТЫ ----------
+            // ---------- ПОЛУЧЕНИЕ СПИСКА ЧАТОВ ----------
             else if (msg.type === 'get_contacts') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -692,7 +682,7 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'pinned_chats', chatIds: pinnedRes.rows.map(r => r.chat_id) }));
             }
 
-            // ---------- ОТПРАВКА СООБЩЕНИЯ (с поддержкой множественных медиа и подписи) ----------
+            // ---------- ОТПРАВКА СООБЩЕНИЯ (с поддержкой множественных медиа) ----------
             else if (msg.type === 'chat_message') {
                 const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType, repliedTo, isMultipleMedia, attachments, caption } = msg;
                 if (!from || (!to && !groupId)) {
@@ -718,10 +708,20 @@ wss.on('connection', (ws) => {
                     }
                 }
 
+                // Преобразуем attachments в JSON-строку
+                let attachmentsJson = null;
+                if (attachments) {
+                    if (typeof attachments === 'string') {
+                        attachmentsJson = attachments;
+                    } else {
+                        attachmentsJson = JSON.stringify(attachments);
+                    }
+                }
+
                 await pool.query(
                     `INSERT INTO messages (id, from_phone, to_phone, group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp, replied_to, is_multiple_media, attachments, caption)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-                    [id, from, to || null, groupId || null, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString(), repliedTo || null, isMultipleMedia || false, attachments || null, caption || null]
+                    [id, from, to || null, groupId || null, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString(), repliedTo || null, isMultipleMedia || false, attachmentsJson, caption || null]
                 );
 
                 if (to) {
@@ -772,7 +772,7 @@ wss.on('connection', (ws) => {
                 console.log(`✅ Сообщение ${id} от ${from}`);
             }
 
-            // ---------- ПОДТВЕРЖДЕНИЕ ДОСТАВКИ СООБЩЕНИЙ (МАССОВОЕ) ----------
+            // ---------- ПОДТВЕРЖДЕНИЕ ДОСТАВКИ ----------
             else if (msg.type === 'mark_delivered') {
                 const { messageIds } = msg;
                 if (!messageIds || !Array.isArray(messageIds) || messageIds.length === 0) return;
@@ -816,7 +816,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ (с новыми полями) ----------
+            // ---------- ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ ----------
             else if (msg.type === 'get_personal_messages') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -846,7 +846,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ПОЛУЧЕНИЕ ГРУППОВОЙ ИСТОРИИ (с новыми полями) ----------
+            // ---------- ПОЛУЧЕНИЕ ГРУППОВОЙ ИСТОРИИ ----------
             else if (msg.type === 'get_group_messages') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -876,7 +876,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ЗАКРЕПЛЕНИЕ / ОТКРЕПЛЕНИЕ / ПОЛУЧЕНИЕ ЗАКРЕПЛЁННОГО СООБЩЕНИЯ ----------
+            // ---------- ЗАКРЕПЛЕНИЕ / ОТКРЕПЛЕНИЕ СООБЩЕНИЙ ----------
             else if (msg.type === 'pin_message') {
                 const { messageId, chatId } = msg;
                 const clientChatId = chatId;
