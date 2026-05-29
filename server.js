@@ -32,6 +32,7 @@ const pool = new Pool({
 
 // ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ==========
 async function initDatabase() {
+    // Таблица пользователей
     await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
             phone VARCHAR(20) PRIMARY KEY,
@@ -46,6 +47,7 @@ async function initDatabase() {
         )
     `);
 
+    // Контакты
     await pool.query(`
         CREATE TABLE IF NOT EXISTS contacts (
             user_phone VARCHAR(20) NOT NULL REFERENCES users(phone) ON DELETE CASCADE,
@@ -55,6 +57,7 @@ async function initDatabase() {
         )
     `);
 
+    // Группы
     await pool.query(`
         CREATE TABLE IF NOT EXISTS groups (
             id TEXT PRIMARY KEY,
@@ -65,6 +68,7 @@ async function initDatabase() {
         )
     `);
 
+    // Участники групп
     await pool.query(`
         CREATE TABLE IF NOT EXISTS group_members (
             group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
@@ -75,6 +79,7 @@ async function initDatabase() {
         )
     `);
 
+    // Сообщения (с поддержкой множественных медиа)
     await pool.query(`
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
@@ -99,6 +104,7 @@ async function initDatabase() {
         )
     `);
 
+    // Сессии
     await pool.query(`
         CREATE TABLE IF NOT EXISTS sessions (
             token VARCHAR(64) PRIMARY KEY,
@@ -107,6 +113,7 @@ async function initDatabase() {
         )
     `);
 
+    // Закреплённые сообщения
     await pool.query(`
         CREATE TABLE IF NOT EXISTS pinned_messages (
             chat_id TEXT NOT NULL,
@@ -117,6 +124,7 @@ async function initDatabase() {
         )
     `);
 
+    // Закреплённые чаты
     await pool.query(`
         CREATE TABLE IF NOT EXISTS pinned_chats (
             user_phone VARCHAR(20) NOT NULL REFERENCES users(phone) ON DELETE CASCADE,
@@ -126,15 +134,20 @@ async function initDatabase() {
         )
     `);
 
+    // Добавление колонки fcm_token, если её нет
     try {
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT`);
     } catch (e) {}
+
+    // Изменяем тип avatar на TEXT, если таблицы уже существовали с VARCHAR
     try {
         await pool.query(`ALTER TABLE users ALTER COLUMN avatar TYPE TEXT`);
     } catch (e) {}
     try {
         await pool.query(`ALTER TABLE groups ALTER COLUMN avatar TYPE TEXT`);
     } catch (e) {}
+
+    // Добавляем новые колонки в messages, если их нет (для совместимости)
     try {
         await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_multiple_media BOOLEAN DEFAULT FALSE`);
     } catch (e) {}
@@ -145,6 +158,7 @@ async function initDatabase() {
         await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS caption TEXT`);
     } catch (e) {}
 
+    // Индексы
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_from_phone ON messages(from_phone)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_to_phone ON messages(to_phone)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_group_id ON messages(group_id)`);
@@ -682,7 +696,7 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'pinned_chats', chatIds: pinnedRes.rows.map(r => r.chat_id) }));
             }
 
-            // ---------- ОТПРАВКА СООБЩЕНИЯ (с поддержкой множественных медиа) ----------
+            // ---------- ОТПРАВКА СООБЩЕНИЯ (с поддержкой множественных медиа и подписи) ----------
             else if (msg.type === 'chat_message') {
                 const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType, repliedTo, isMultipleMedia, attachments, caption } = msg;
                 if (!from || (!to && !groupId)) {
@@ -708,13 +722,19 @@ wss.on('connection', (ws) => {
                     }
                 }
 
-                // Преобразуем attachments в JSON-строку
+                // Безопасное преобразование attachments в JSON-строку
                 let attachmentsJson = null;
-                if (attachments) {
-                    if (typeof attachments === 'string') {
-                        attachmentsJson = attachments;
-                    } else {
+                if (attachments && Array.isArray(attachments) && attachments.length > 0) {
+                    try {
                         attachmentsJson = JSON.stringify(attachments);
+                        // Проверка, что получилась строка
+                        if (typeof attachmentsJson !== 'string') {
+                            console.error('attachmentsJson не строка:', attachmentsJson);
+                            attachmentsJson = null;
+                        }
+                    } catch (err) {
+                        console.error('Ошибка при JSON.stringify(attachments):', err);
+                        attachmentsJson = null;
                     }
                 }
 
@@ -724,6 +744,7 @@ wss.on('connection', (ws) => {
                     [id, from, to || null, groupId || null, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString(), repliedTo || null, isMultipleMedia || false, attachmentsJson, caption || null]
                 );
 
+                // Рассылка сообщения (без изменений)
                 if (to) {
                     const recipientWs = clients.get(to);
                     if (recipientWs) {
@@ -876,7 +897,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ЗАКРЕПЛЕНИЕ / ОТКРЕПЛЕНИЕ СООБЩЕНИЙ ----------
+            // ---------- ЗАКРЕПЛЕНИЕ / ОТКРЕПЛЕНИЕ ----------
             else if (msg.type === 'pin_message') {
                 const { messageId, chatId } = msg;
                 const clientChatId = chatId;
