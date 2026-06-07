@@ -5,7 +5,6 @@ const http = require('http');
 const axios = require('axios');
 const { GoogleAuth } = require('google-auth-library');
 
-// ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
 const PORT = process.env.PORT || 8080;
 const DATABASE_URL = process.env.DATABASE_URL;
 const FCM_PROJECT_ID = process.env.FCM_PROJECT_ID;
@@ -30,7 +29,6 @@ const pool = new Pool({
     query_timeout: 15000,
 });
 
-// ========== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ (без изменений) ==========
 async function initDatabase() {
     await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
@@ -149,11 +147,8 @@ async function initDatabase() {
 }
 initDatabase().catch(console.error);
 
-// ========== ГЛОБАЛЬНОЕ ХРАНИЛИЩЕ АКТИВНЫХ СОЕДИНЕНИЙ ==========
 const clients = new Map();
 
-// ========== HTTP + WEBSOCKET С УВЕЛИЧЕННЫМИ ЛИМИТАМИ ==========
-// Убираем все ограничения: maxPayload = 200 МБ (можно увеличить до 500 МБ)
 const wss = new WebSocket.Server({ noServer: true, maxPayload: 200 * 1024 * 1024 });
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -167,7 +162,6 @@ server.on('upgrade', (request, socket, head) => {
 server.listen(PORT, '0.0.0.0');
 console.log(`🚀 Сервер запущен на порту ${PORT} с maxPayload = 200 МБ`);
 
-// ========== УТИЛИТЫ ==========
 function generateToken() {
     return crypto.randomBytes(32).toString('hex');
 }
@@ -210,7 +204,6 @@ async function sendFCMNotification(phone, title, body, data = {}) {
     }
 }
 
-// ========== ОБРАБОТКА ПОДКЛЮЧЕНИЙ ==========
 wss.on('connection', (ws) => {
     const clientId = Math.random().toString(36).substr(2, 9);
     let userPhone = null;
@@ -339,7 +332,7 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'chat_created', success: true }));
             }
 
-            // ========== ГРУППЫ ==========
+            // ---------- ГРУППЫ ----------
             else if (msg.type === 'create_group') {
                 const { name, avatar, members } = msg;
                 if (!name || !members || !Array.isArray(members) || members.length === 0) {
@@ -675,7 +668,7 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'pinned_chats', chatIds: pinnedRes.rows.map(r => r.chat_id) }));
             }
 
-            // ---------- ОТПРАВКА СООБЩЕНИЯ (С ПОДДЕРЖКОЙ БОЛЬШИХ ФАЙЛОВ) ----------
+            // ---------- ОТПРАВКА СООБЩЕНИЯ ----------
             else if (msg.type === 'chat_message') {
                 const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType, repliedTo, isMultipleMedia, attachments, caption } = msg;
                 if (!from || (!to && !groupId)) {
@@ -809,7 +802,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ (С ПАРСИНГОМ ATTACHMENTS) ----------
+            // ---------- ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ ----------
             else if (msg.type === 'get_personal_messages') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -832,7 +825,6 @@ wss.on('connection', (ws) => {
                         [userPhone, limit, offset]
                     );
                     let messages = result.rows.reverse();
-                    // Преобразуем attachments из JSON строки в объект
                     messages = messages.map(m => {
                         if (m.attachments && typeof m.attachments === 'string') {
                             try {
@@ -851,7 +843,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ПОЛУЧЕНИЕ ГРУППОВОЙ ИСТОРИИ (С ПАРСИНГОМ ATTACHMENTS) ----------
+            // ---------- ПОЛУЧЕНИЕ ГРУППОВОЙ ИСТОРИИ ----------
             else if (msg.type === 'get_group_messages') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -892,7 +884,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ЗАКРЕПЛЕНИЕ / ОТКРЕПЛЕНИЕ ----------
+            // ---------- ЗАКРЕПЛЕНИЕ / ОТКРЕПЛЕНИЕ СООБЩЕНИЙ ----------
             else if (msg.type === 'pin_message') {
                 const { messageId, chatId } = msg;
                 const clientChatId = chatId;
@@ -1228,6 +1220,40 @@ wss.on('connection', (ws) => {
                     values.push(user.phone);
                     await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE phone = $${idx}`, values);
                 }
+
+                // Получаем обновлённые данные пользователя
+                const updatedUserRes = await pool.query('SELECT phone, name, avatar, status, email, settings, last_seen FROM users WHERE phone = $1', [user.phone]);
+                const updatedUser = updatedUserRes.rows[0];
+
+                // Собираем получателей: контакты и участники групп
+                const recipients = new Set();
+
+                // 1. Контакты (те, у кого этот пользователь есть в contacts)
+                const contactsRes = await pool.query('SELECT user_phone FROM contacts WHERE contact_phone = $1', [user.phone]);
+                contactsRes.rows.forEach(r => recipients.add(r.user_phone));
+
+                // 2. Участники групп (все, кто состоит в тех же группах, что и пользователь)
+                const groupsRes = await pool.query(`
+                    SELECT DISTINCT gm2.user_phone
+                    FROM group_members gm1
+                    JOIN group_members gm2 ON gm1.group_id = gm2.group_id
+                    WHERE gm1.user_phone = $1 AND gm2.user_phone != $1
+                `, [user.phone]);
+                groupsRes.rows.forEach(r => recipients.add(r.user_phone));
+
+                // Отправляем уведомление каждому получателю
+                for (const phone of recipients) {
+                    const client = clients.get(phone);
+                    if (client) {
+                        client.send(JSON.stringify({ type: 'profile_data', user: updatedUser }));
+                    }
+                }
+                // Отправим самому пользователю
+                const selfClient = clients.get(user.phone);
+                if (selfClient) {
+                    selfClient.send(JSON.stringify({ type: 'profile_data', user: updatedUser }));
+                }
+                console.log(`👤 Профиль ${user.phone} обновлён и разослан ${recipients.size + 1} получателям`);
             }
 
             else if (msg.type === 'get_profile') {
@@ -1239,6 +1265,46 @@ wss.on('connection', (ws) => {
                 } else {
                     ws.send(JSON.stringify({ type: 'profile_error', error: 'Пользователь не найден' }));
                 }
+            }
+
+            // ---------- ОБНОВЛЕНИЕ ГРУППЫ (НОВЫЙ ОБРАБОТЧИК) ----------
+            else if (msg.type === 'update_group') {
+                const { groupId, name, avatar } = msg;
+                if (!groupId || (!name && !avatar)) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Не указаны groupId или данные для обновления' }));
+                    return;
+                }
+                // Проверка прав (администратор группы)
+                const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
+                if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
+                    return;
+                }
+                // Обновление группы
+                if (name) {
+                    await pool.query('UPDATE groups SET name = $1 WHERE id = $2', [name, groupId]);
+                }
+                if (avatar) {
+                    await pool.query('UPDATE groups SET avatar = $1 WHERE id = $2', [avatar, groupId]);
+                }
+                // Получаем обновлённые данные группы
+                const groupRes = await pool.query('SELECT id, name, avatar, created_by FROM groups WHERE id = $1', [groupId]);
+                const updatedGroup = groupRes.rows[0];
+                // Рассылаем всем участникам группы
+                const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
+                for (const member of membersRes.rows) {
+                    const memberWs = clients.get(member.user_phone);
+                    if (memberWs) {
+                        memberWs.send(JSON.stringify({
+                            type: 'group_updated',
+                            groupId,
+                            name: updatedGroup.name,
+                            avatar: updatedGroup.avatar
+                        }));
+                    }
+                }
+                ws.send(JSON.stringify({ type: 'group_updated', groupId, name: updatedGroup.name, avatar: updatedGroup.avatar }));
+                console.log(`👥 Группа ${groupId} обновлена участником ${userPhone}`);
             }
 
             // ---------- СМЕНА ПАРОЛЯ / ВЫХОД ----------
@@ -1315,7 +1381,6 @@ wss.on('connection', (ws) => {
     ws.on('error', (err) => console.error(`⚠️ [${clientId}] Ошибка сокета:`, err.message));
 });
 
-// ========== PING ==========
 setInterval(() => {
     wss.clients.forEach(ws => {
         if (ws.isAlive === false) return ws.terminate();
