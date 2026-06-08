@@ -1228,11 +1228,9 @@ wss.on('connection', (ws) => {
                 // Собираем получателей: контакты и участники групп
                 const recipients = new Set();
 
-                // 1. Контакты (те, у кого этот пользователь есть в contacts)
                 const contactsRes = await pool.query('SELECT user_phone FROM contacts WHERE contact_phone = $1', [user.phone]);
                 contactsRes.rows.forEach(r => recipients.add(r.user_phone));
 
-                // 2. Участники групп (все, кто состоит в тех же группах, что и пользователь)
                 const groupsRes = await pool.query(`
                     SELECT DISTINCT gm2.user_phone
                     FROM group_members gm1
@@ -1241,14 +1239,12 @@ wss.on('connection', (ws) => {
                 `, [user.phone]);
                 groupsRes.rows.forEach(r => recipients.add(r.user_phone));
 
-                // Отправляем уведомление каждому получателю
                 for (const phone of recipients) {
                     const client = clients.get(phone);
                     if (client) {
                         client.send(JSON.stringify({ type: 'profile_data', user: updatedUser }));
                     }
                 }
-                // Отправим самому пользователю
                 const selfClient = clients.get(user.phone);
                 if (selfClient) {
                     selfClient.send(JSON.stringify({ type: 'profile_data', user: updatedUser }));
@@ -1267,30 +1263,26 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ОБНОВЛЕНИЕ ГРУППЫ (НОВЫЙ ОБРАБОТЧИК) ----------
+            // ---------- ОБНОВЛЕНИЕ ГРУППЫ ----------
             else if (msg.type === 'update_group') {
                 const { groupId, name, avatar } = msg;
                 if (!groupId || (!name && !avatar)) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не указаны groupId или данные для обновления' }));
                     return;
                 }
-                // Проверка прав (администратор группы)
                 const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
                 if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
                     ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
                     return;
                 }
-                // Обновление группы
                 if (name) {
                     await pool.query('UPDATE groups SET name = $1 WHERE id = $2', [name, groupId]);
                 }
                 if (avatar) {
                     await pool.query('UPDATE groups SET avatar = $1 WHERE id = $2', [avatar, groupId]);
                 }
-                // Получаем обновлённые данные группы
                 const groupRes = await pool.query('SELECT id, name, avatar, created_by FROM groups WHERE id = $1', [groupId]);
                 const updatedGroup = groupRes.rows[0];
-                // Рассылаем всем участникам группы
                 const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
                 for (const member of membersRes.rows) {
                     const memberWs = clients.get(member.user_phone);
