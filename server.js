@@ -89,7 +89,9 @@ async function initDatabase() {
             timestamp TIMESTAMP DEFAULT NOW(),
             is_multiple_media BOOLEAN DEFAULT false,
             attachments JSONB,
-            caption TEXT
+            caption TEXT,
+            is_sticker BOOLEAN DEFAULT false,
+            sticker_data JSONB
         )
     `);
     await pool.query(`
@@ -133,6 +135,13 @@ async function initDatabase() {
     } catch (e) {}
     try {
         await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS caption TEXT`);
+    } catch (e) {}
+    // Добавляем колонки для стикеров
+    try {
+        await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_sticker BOOLEAN DEFAULT FALSE`);
+    } catch (e) {}
+    try {
+        await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS sticker_data JSONB`);
     } catch (e) {}
 
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_from_phone ON messages(from_phone)`);
@@ -668,9 +677,9 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'pinned_chats', chatIds: pinnedRes.rows.map(r => r.chat_id) }));
             }
 
-            // ---------- ОТПРАВКА СООБЩЕНИЯ ----------
+            // ---------- ОТПРАВКА СООБЩЕНИЯ (с поддержкой стикеров и множественных медиа) ----------
             else if (msg.type === 'chat_message') {
-                const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType, repliedTo, isMultipleMedia, attachments, caption } = msg;
+                const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType, repliedTo, isMultipleMedia, attachments, caption, isSticker, stickerData } = msg;
                 if (!from || (!to && !groupId)) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Отправитель и получатель/группа обязательны' }));
                     return;
@@ -704,10 +713,20 @@ wss.on('connection', (ws) => {
                     }
                 }
 
+                let stickerDataJson = null;
+                if (isSticker && stickerData) {
+                    try {
+                        stickerDataJson = JSON.stringify(stickerData);
+                    } catch (err) {
+                        console.error('Ошибка при JSON.stringify(stickerData):', err);
+                        stickerDataJson = null;
+                    }
+                }
+
                 await pool.query(
-                    `INSERT INTO messages (id, from_phone, to_phone, group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp, replied_to, is_multiple_media, attachments, caption)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-                    [id, from, to || null, groupId || null, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString(), repliedTo || null, isMultipleMedia || false, attachmentsJson, caption || null]
+                    `INSERT INTO messages (id, from_phone, to_phone, group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp, replied_to, is_multiple_media, attachments, caption, is_sticker, sticker_data)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+                    [id, from, to || null, groupId || null, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString(), repliedTo || null, isMultipleMedia || false, attachmentsJson, caption || null, isSticker || false, stickerDataJson]
                 );
 
                 if (to) {
@@ -720,13 +739,18 @@ wss.on('connection', (ws) => {
                             fileName, fileSize, fileType, repliedTo,
                             isMultipleMedia: isMultipleMedia || false,
                             attachments: attachments || null,
-                            caption: caption || null
+                            caption: caption || null,
+                            isSticker: isSticker || false,
+                            stickerData: stickerData || null
                         }));
                         await pool.query('UPDATE messages SET delivered = true WHERE id = $1', [id]);
                         ws.send(JSON.stringify({ type: 'message_delivered', messageId: id, to }));
                     } else {
-                        await sendFCMNotification(to, fromName || from,
-                            isVoice ? '🎤 Голосовое' : (isFile ? `📎 ${fileName}` : content), {});
+                        let bodyText = content;
+                        if (isVoice) bodyText = '🎤 Голосовое';
+                        else if (isFile) bodyText = `📎 ${fileName}`;
+                        else if (isSticker) bodyText = `🎨 Стикер: ${stickerData?.text || ''}`;
+                        await sendFCMNotification(to, fromName || from, bodyText, {});
                     }
                 } else if (groupId) {
                     const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
@@ -742,12 +766,17 @@ wss.on('connection', (ws) => {
                                 fileName, fileSize, fileType, repliedTo,
                                 isMultipleMedia: isMultipleMedia || false,
                                 attachments: attachments || null,
-                                caption: caption || null
+                                caption: caption || null,
+                                isSticker: isSticker || false,
+                                stickerData: stickerData || null
                             }));
                             deliveredCount++;
                         } else {
-                            await sendFCMNotification(member.user_phone, fromName || from,
-                                isVoice ? '🎤 Голосовое' : (isFile ? `📎 ${fileName}` : content), {});
+                            let bodyText = content;
+                            if (isVoice) bodyText = '🎤 Голосовое';
+                            else if (isFile) bodyText = `📎 ${fileName}`;
+                            else if (isSticker) bodyText = `🎨 Стикер: ${stickerData?.text || ''}`;
+                            await sendFCMNotification(member.user_phone, fromName || from, bodyText, {});
                         }
                     }
                     if (deliveredCount > 0) {
@@ -802,7 +831,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ ----------
+            // ---------- ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ (включая стикеры и множественные медиа) ----------
             else if (msg.type === 'get_personal_messages') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -816,7 +845,8 @@ wss.on('connection', (ws) => {
                                 content, encrypted, is_file, is_voice,
                                 file_name, file_size, file_type,
                                 delivered, read, timestamp, replied_to, edited,
-                                is_multiple_media, attachments, caption
+                                is_multiple_media, attachments, caption,
+                                is_sticker, sticker_data
                          FROM messages
                          WHERE (from_phone = $1 OR to_phone = $1)
                            AND group_id IS NULL
@@ -834,6 +864,14 @@ wss.on('connection', (ws) => {
                                 m.attachments = null;
                             }
                         }
+                        if (m.sticker_data && typeof m.sticker_data === 'string') {
+                            try {
+                                m.sticker_data = JSON.parse(m.sticker_data);
+                            } catch(e) {
+                                console.error('Ошибка парсинга sticker_data для сообщения', m.id, e);
+                                m.sticker_data = null;
+                            }
+                        }
                         return m;
                     });
                     ws.send(JSON.stringify({ type: 'personal_messages_history', messages }));
@@ -843,7 +881,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ПОЛУЧЕНИЕ ГРУППОВОЙ ИСТОРИИ ----------
+            // ---------- ПОЛУЧЕНИЕ ГРУППОВОЙ ИСТОРИИ (включая стикеры и множественные медиа) ----------
             else if (msg.type === 'get_group_messages') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -857,7 +895,8 @@ wss.on('connection', (ws) => {
                                 m.content, m.encrypted, m.is_file, m.is_voice,
                                 m.file_name, m.file_size, m.file_type,
                                 m.delivered, m.read, m.timestamp, m.replied_to, m.edited,
-                                m.is_multiple_media, m.attachments, m.caption
+                                m.is_multiple_media, m.attachments, m.caption,
+                                m.is_sticker, m.sticker_data
                          FROM messages m
                          INNER JOIN group_members gm ON m.group_id = gm.group_id
                          WHERE gm.user_phone = $1
@@ -873,6 +912,14 @@ wss.on('connection', (ws) => {
                             } catch(e) {
                                 console.error('Ошибка парсинга attachments для сообщения', m.id, e);
                                 m.attachments = null;
+                            }
+                        }
+                        if (m.sticker_data && typeof m.sticker_data === 'string') {
+                            try {
+                                m.sticker_data = JSON.parse(m.sticker_data);
+                            } catch(e) {
+                                console.error('Ошибка парсинга sticker_data для сообщения', m.id, e);
+                                m.sticker_data = null;
                             }
                         }
                         return m;
@@ -895,7 +942,7 @@ wss.on('connection', (ws) => {
 
                 const msgCheck = await pool.query(
                     `SELECT id, from_phone, to_phone, group_id, content, is_file, is_voice,
-                            file_name, file_size, file_type, timestamp
+                            file_name, file_size, file_type, timestamp, is_sticker, sticker_data
                      FROM messages WHERE id = $1`,
                     [messageId]
                 );
@@ -959,7 +1006,9 @@ wss.on('connection', (ws) => {
                         file_name: message.file_name,
                         file_size: message.file_size,
                         file_type: message.file_type,
-                        timestamp: message.timestamp
+                        timestamp: message.timestamp,
+                        is_sticker: message.is_sticker,
+                        sticker_data: message.sticker_data
                     },
                     pinned_by: userPhone
                 };
@@ -1079,14 +1128,21 @@ wss.on('connection', (ws) => {
                     const pinnedRes = await pool.query(
                         `SELECT m.id, m.from_phone, m.to_phone, m.group_id, m.content,
                                 m.is_file, m.is_voice, m.file_name, m.file_size, m.file_type,
-                                m.timestamp, pm.pinned_by, pm.pinned_at
+                                m.timestamp, pm.pinned_by, pm.pinned_at,
+                                m.is_sticker, m.sticker_data
                          FROM pinned_messages pm
                          JOIN messages m ON pm.message_id = m.id
                          WHERE pm.chat_id = $1`,
                         [canonicalChatId]
                     );
                     if (pinnedRes.rows.length > 0) {
-                        ws.send(JSON.stringify({ type: 'pinned_message', message: pinnedRes.rows[0], chatId: clientChatId }));
+                        let pinnedMsg = pinnedRes.rows[0];
+                        if (pinnedMsg.sticker_data && typeof pinnedMsg.sticker_data === 'string') {
+                            try {
+                                pinnedMsg.sticker_data = JSON.parse(pinnedMsg.sticker_data);
+                            } catch(e) {}
+                        }
+                        ws.send(JSON.stringify({ type: 'pinned_message', message: pinnedMsg, chatId: clientChatId }));
                     } else {
                         ws.send(JSON.stringify({ type: 'pinned_message', message: null, chatId: clientChatId }));
                     }
