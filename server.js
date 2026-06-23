@@ -89,9 +89,7 @@ async function initDatabase() {
             timestamp TIMESTAMP DEFAULT NOW(),
             is_multiple_media BOOLEAN DEFAULT false,
             attachments JSONB,
-            caption TEXT,
-            is_sticker BOOLEAN DEFAULT false,
-            sticker_data JSONB
+            caption TEXT
         )
     `);
     await pool.query(`
@@ -136,12 +134,9 @@ async function initDatabase() {
     try {
         await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS caption TEXT`);
     } catch (e) {}
-    // Добавляем колонки для стикеров
+    // ДОБАВЛЕНИЕ СТОЛБЦА PERMISSIONS ДЛЯ ГРУППОВЫХ УЧАСТНИКОВ (НОВОЕ)
     try {
-        await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_sticker BOOLEAN DEFAULT FALSE`);
-    } catch (e) {}
-    try {
-        await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS sticker_data JSONB`);
+        await pool.query(`ALTER TABLE group_members ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`);
     } catch (e) {}
 
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_from_phone ON messages(from_phone)`);
@@ -351,14 +346,14 @@ wss.on('connection', (ws) => {
                 const groupId = generateId();
                 await pool.query('INSERT INTO groups (id, name, avatar, created_by) VALUES ($1, $2, $3, $4)',
                     [groupId, name, avatar || '👥', userPhone]);
-                await pool.query('INSERT INTO group_members (group_id, user_phone, role) VALUES ($1, $2, $3)',
-                    [groupId, userPhone, 'admin']);
+                await pool.query('INSERT INTO group_members (group_id, user_phone, role, permissions) VALUES ($1, $2, $3, $4)',
+                    [groupId, userPhone, 'admin', JSON.stringify({})]);
                 for (const phone of members) {
                     if (phone === userPhone) continue;
                     const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [phone]);
                     if (userExists.rows.length === 0) continue;
-                    await pool.query('INSERT INTO group_members (group_id, user_phone, role) VALUES ($1, $2, $3)',
-                        [groupId, phone, 'member']);
+                    await pool.query('INSERT INTO group_members (group_id, user_phone, role, permissions) VALUES ($1, $2, $3, $4)',
+                        [groupId, phone, 'member', JSON.stringify({})]);
                 }
                 const group = { id: groupId, name, avatar: avatar || '👥', type: 'group' };
                 const allMembers = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
@@ -382,8 +377,9 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Вы не состоите в этой группе' }));
                     return;
                 }
+                // ДОБАВЛЕНО ПОЛЕ permissions В SELECT
                 const membersRes = await pool.query(`
-                    SELECT gm.user_phone, u.name, u.avatar, u.status, gm.role
+                    SELECT gm.user_phone, u.name, u.avatar, u.status, gm.role, gm.permissions
                     FROM group_members gm
                     JOIN users u ON gm.user_phone = u.phone
                     WHERE gm.group_id = $1
@@ -410,8 +406,8 @@ wss.on('connection', (ws) => {
                     const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [phone]);
                     if (userExists.rows.length === 0) continue;
                     try {
-                        await pool.query('INSERT INTO group_members (group_id, user_phone, role) VALUES ($1, $2, $3)',
-                            [groupId, phone, 'member']);
+                        await pool.query('INSERT INTO group_members (group_id, user_phone, role, permissions) VALUES ($1, $2, $3, $4)',
+                            [groupId, phone, 'member', JSON.stringify({})]);
                         added.push(phone);
                     } catch (e) {}
                 }
@@ -446,7 +442,7 @@ wss.on('connection', (ws) => {
                         const adminsLeft = remaining.rows.filter(r => r.role === 'admin');
                         if (adminsLeft.length === 0) {
                             const newAdmin = remaining.rows[0].user_phone;
-                            await pool.query('UPDATE group_members SET role = $1 WHERE group_id = $2 AND user_phone = $3', ['admin', groupId, newAdmin]);
+                            await pool.query('UPDATE group_members SET role = $1, permissions = $2 WHERE group_id = $3 AND user_phone = $4', ['admin', JSON.stringify({}), groupId, newAdmin]);
                             await pool.query('UPDATE groups SET created_by = $1 WHERE id = $2', [newAdmin, groupId]);
                         }
                         const notification = {
@@ -503,7 +499,7 @@ wss.on('connection', (ws) => {
                     const adminsLeft = remaining.rows.filter(r => r.role === 'admin');
                     if (adminsLeft.length === 0) {
                         const newAdmin = remaining.rows[0].user_phone;
-                        await pool.query('UPDATE group_members SET role = $1 WHERE group_id = $2 AND user_phone = $3', ['admin', groupId, newAdmin]);
+                        await pool.query('UPDATE group_members SET role = $1, permissions = $2 WHERE group_id = $3 AND user_phone = $4', ['admin', JSON.stringify({}), groupId, newAdmin]);
                         await pool.query('UPDATE groups SET created_by = $1 WHERE id = $2', [newAdmin, groupId]);
                     }
                     const notification = {
@@ -545,7 +541,7 @@ wss.on('connection', (ws) => {
             }
 
             else if (msg.type === 'promote_to_admin') {
-                const { groupId, member } = msg;
+                const { groupId, member, permissions } = msg;
                 if (!groupId || !member) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не указана группа или участник' }));
                     return;
@@ -564,19 +560,23 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Участник уже администратор' }));
                     return;
                 }
-                await pool.query('UPDATE group_members SET role = $1 WHERE group_id = $2 AND user_phone = $3', ['admin', groupId, member]);
+                // СОХРАНЯЕМ ПРАВА, ПЕРЕДАННЫЕ С КЛИЕНТА, ИЛИ ПО УМОЛЧАНИЮ
+                const perms = permissions || { can_manage_members: false, can_edit_group_info: false };
+                await pool.query('UPDATE group_members SET role = $1, permissions = $2 WHERE group_id = $3 AND user_phone = $4',
+                    ['admin', JSON.stringify(perms), groupId, member]);
                 const allMembers = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
                 const notification = {
                     type: 'group_member_promoted',
                     groupId,
                     member,
-                    newRole: 'admin'
+                    newRole: 'admin',
+                    permissions: perms
                 };
                 for (const row of allMembers.rows) {
                     const client = clients.get(row.user_phone);
                     if (client) client.send(JSON.stringify(notification));
                 }
-                ws.send(JSON.stringify({ type: 'group_member_promoted', groupId, member }));
+                ws.send(JSON.stringify({ type: 'group_member_promoted', groupId, member, permissions: perms }));
             }
 
             else if (msg.type === 'demote_to_member') {
@@ -595,7 +595,9 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Нельзя понизить единственного администратора' }));
                     return;
                 }
-                await pool.query('UPDATE group_members SET role = $1 WHERE group_id = $2 AND user_phone = $3', ['member', groupId, member]);
+                // СБРАСЫВАЕМ ПРАВА ПРИ ПОНИЖЕНИИ
+                await pool.query('UPDATE group_members SET role = $1, permissions = $2 WHERE group_id = $3 AND user_phone = $4',
+                    ['member', JSON.stringify({}), groupId, member]);
                 const allMembers = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
                 const notification = {
                     type: 'group_member_demoted',
@@ -608,6 +610,46 @@ wss.on('connection', (ws) => {
                     if (client) client.send(JSON.stringify(notification));
                 }
                 ws.send(JSON.stringify({ type: 'group_member_demoted', groupId, member }));
+            }
+
+            // НОВЫЙ ОБРАБОТЧИК: ОБНОВЛЕНИЕ ПРАВ АДМИНИСТРАТОРА (ТОЛЬКО ДЛЯ СОЗДАТЕЛЯ)
+            else if (msg.type === 'update_admin_permissions') {
+                const { groupId, member, permissions } = msg;
+                if (!groupId || !member || !permissions || typeof permissions !== 'object') {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Не указаны группа, участник или права' }));
+                    return;
+                }
+                const groupRes = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
+                if (groupRes.rows.length === 0 || groupRes.rows[0].created_by !== userPhone) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Только создатель группы может изменять права администраторов' }));
+                    return;
+                }
+                const targetCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, member]);
+                if (targetCheck.rows.length === 0 || targetCheck.rows[0].role !== 'admin') {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Указанный пользователь не является администратором' }));
+                    return;
+                }
+                // Защита: гарантируем, что права на кик других админов никогда не передаются
+                const safePermissions = { ...permissions };
+                if (safePermissions.can_manage_members === undefined) safePermissions.can_manage_members = false;
+                if (safePermissions.can_edit_group_info === undefined) safePermissions.can_edit_group_info = false;
+
+                await pool.query('UPDATE group_members SET permissions = $1 WHERE group_id = $2 AND user_phone = $3',
+                    [JSON.stringify(safePermissions), groupId, member]);
+
+                const allMembers = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
+                const notification = {
+                    type: 'admin_permissions_updated',
+                    groupId,
+                    member,
+                    permissions: safePermissions
+                };
+                for (const row of allMembers.rows) {
+                    const client = clients.get(row.user_phone);
+                    if (client) client.send(JSON.stringify(notification));
+                }
+                ws.send(JSON.stringify({ type: 'admin_permissions_updated', groupId, member, permissions: safePermissions }));
+                console.log(`🔑 Права администратора ${member} в группе ${groupId} обновлены на ${JSON.stringify(safePermissions)}`);
             }
 
             // ---------- ПОЛУЧЕНИЕ СПИСКА ЧАТОВ ----------
@@ -624,8 +666,9 @@ wss.on('connection', (ws) => {
                 `, [userPhone]);
                 const contacts = contactsRes.rows;
 
+                // ДОБАВЛЕНЫ ROLE И PERMISSIONS В ЗАПРОС, ЧТОБЫ КЛИЕНТ МОГ ОПРЕДЕЛИТЬ АДМИНА
                 const groupsRes = await pool.query(`
-                    SELECT g.id, g.name, g.avatar,
+                    SELECT g.id, g.name, g.avatar, gm.role, gm.permissions,
                            (SELECT COUNT(*) FROM group_members WHERE group_id = g.id) as member_count
                     FROM groups g
                     JOIN group_members gm ON g.id = gm.group_id
@@ -635,6 +678,8 @@ wss.on('connection', (ws) => {
                     id: r.id,
                     name: r.name,
                     avatar: r.avatar,
+                    role: r.role,
+                    permissions: r.permissions || {},
                     memberCount: parseInt(r.member_count)
                 }));
 
@@ -677,9 +722,9 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ type: 'pinned_chats', chatIds: pinnedRes.rows.map(r => r.chat_id) }));
             }
 
-            // ---------- ОТПРАВКА СООБЩЕНИЯ (с поддержкой стикеров и множественных медиа) ----------
+            // ---------- ОТПРАВКА СООБЩЕНИЯ ----------
             else if (msg.type === 'chat_message') {
-                const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType, repliedTo, isMultipleMedia, attachments, caption, isSticker, stickerData } = msg;
+                const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType, repliedTo, isMultipleMedia, attachments, caption } = msg;
                 if (!from || (!to && !groupId)) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Отправитель и получатель/группа обязательны' }));
                     return;
@@ -713,20 +758,10 @@ wss.on('connection', (ws) => {
                     }
                 }
 
-                let stickerDataJson = null;
-                if (isSticker && stickerData) {
-                    try {
-                        stickerDataJson = JSON.stringify(stickerData);
-                    } catch (err) {
-                        console.error('Ошибка при JSON.stringify(stickerData):', err);
-                        stickerDataJson = null;
-                    }
-                }
-
                 await pool.query(
-                    `INSERT INTO messages (id, from_phone, to_phone, group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp, replied_to, is_multiple_media, attachments, caption, is_sticker, sticker_data)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
-                    [id, from, to || null, groupId || null, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString(), repliedTo || null, isMultipleMedia || false, attachmentsJson, caption || null, isSticker || false, stickerDataJson]
+                    `INSERT INTO messages (id, from_phone, to_phone, group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp, replied_to, is_multiple_media, attachments, caption)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+                    [id, from, to || null, groupId || null, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString(), repliedTo || null, isMultipleMedia || false, attachmentsJson, caption || null]
                 );
 
                 if (to) {
@@ -739,18 +774,13 @@ wss.on('connection', (ws) => {
                             fileName, fileSize, fileType, repliedTo,
                             isMultipleMedia: isMultipleMedia || false,
                             attachments: attachments || null,
-                            caption: caption || null,
-                            isSticker: isSticker || false,
-                            stickerData: stickerData || null
+                            caption: caption || null
                         }));
                         await pool.query('UPDATE messages SET delivered = true WHERE id = $1', [id]);
                         ws.send(JSON.stringify({ type: 'message_delivered', messageId: id, to }));
                     } else {
-                        let bodyText = content;
-                        if (isVoice) bodyText = '🎤 Голосовое';
-                        else if (isFile) bodyText = `📎 ${fileName}`;
-                        else if (isSticker) bodyText = `🎨 Стикер: ${stickerData?.text || ''}`;
-                        await sendFCMNotification(to, fromName || from, bodyText, {});
+                        await sendFCMNotification(to, fromName || from,
+                            isVoice ? '🎤 Голосовое' : (isFile ? `📎 ${fileName}` : content), {});
                     }
                 } else if (groupId) {
                     const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
@@ -766,17 +796,12 @@ wss.on('connection', (ws) => {
                                 fileName, fileSize, fileType, repliedTo,
                                 isMultipleMedia: isMultipleMedia || false,
                                 attachments: attachments || null,
-                                caption: caption || null,
-                                isSticker: isSticker || false,
-                                stickerData: stickerData || null
+                                caption: caption || null
                             }));
                             deliveredCount++;
                         } else {
-                            let bodyText = content;
-                            if (isVoice) bodyText = '🎤 Голосовое';
-                            else if (isFile) bodyText = `📎 ${fileName}`;
-                            else if (isSticker) bodyText = `🎨 Стикер: ${stickerData?.text || ''}`;
-                            await sendFCMNotification(member.user_phone, fromName || from, bodyText, {});
+                            await sendFCMNotification(member.user_phone, fromName || from,
+                                isVoice ? '🎤 Голосовое' : (isFile ? `📎 ${fileName}` : content), {});
                         }
                     }
                     if (deliveredCount > 0) {
@@ -831,7 +856,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ (включая стикеры и множественные медиа) ----------
+            // ---------- ПОЛУЧЕНИЕ ЛИЧНОЙ ИСТОРИИ ----------
             else if (msg.type === 'get_personal_messages') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -845,8 +870,7 @@ wss.on('connection', (ws) => {
                                 content, encrypted, is_file, is_voice,
                                 file_name, file_size, file_type,
                                 delivered, read, timestamp, replied_to, edited,
-                                is_multiple_media, attachments, caption,
-                                is_sticker, sticker_data
+                                is_multiple_media, attachments, caption
                          FROM messages
                          WHERE (from_phone = $1 OR to_phone = $1)
                            AND group_id IS NULL
@@ -864,14 +888,6 @@ wss.on('connection', (ws) => {
                                 m.attachments = null;
                             }
                         }
-                        if (m.sticker_data && typeof m.sticker_data === 'string') {
-                            try {
-                                m.sticker_data = JSON.parse(m.sticker_data);
-                            } catch(e) {
-                                console.error('Ошибка парсинга sticker_data для сообщения', m.id, e);
-                                m.sticker_data = null;
-                            }
-                        }
                         return m;
                     });
                     ws.send(JSON.stringify({ type: 'personal_messages_history', messages }));
@@ -881,7 +897,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ПОЛУЧЕНИЕ ГРУППОВОЙ ИСТОРИИ (включая стикеры и множественные медиа) ----------
+            // ---------- ПОЛУЧЕНИЕ ГРУППОВОЙ ИСТОРИИ ----------
             else if (msg.type === 'get_group_messages') {
                 if (!userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не авторизован' }));
@@ -895,8 +911,7 @@ wss.on('connection', (ws) => {
                                 m.content, m.encrypted, m.is_file, m.is_voice,
                                 m.file_name, m.file_size, m.file_type,
                                 m.delivered, m.read, m.timestamp, m.replied_to, m.edited,
-                                m.is_multiple_media, m.attachments, m.caption,
-                                m.is_sticker, m.sticker_data
+                                m.is_multiple_media, m.attachments, m.caption
                          FROM messages m
                          INNER JOIN group_members gm ON m.group_id = gm.group_id
                          WHERE gm.user_phone = $1
@@ -912,14 +927,6 @@ wss.on('connection', (ws) => {
                             } catch(e) {
                                 console.error('Ошибка парсинга attachments для сообщения', m.id, e);
                                 m.attachments = null;
-                            }
-                        }
-                        if (m.sticker_data && typeof m.sticker_data === 'string') {
-                            try {
-                                m.sticker_data = JSON.parse(m.sticker_data);
-                            } catch(e) {
-                                console.error('Ошибка парсинга sticker_data для сообщения', m.id, e);
-                                m.sticker_data = null;
                             }
                         }
                         return m;
@@ -942,7 +949,7 @@ wss.on('connection', (ws) => {
 
                 const msgCheck = await pool.query(
                     `SELECT id, from_phone, to_phone, group_id, content, is_file, is_voice,
-                            file_name, file_size, file_type, timestamp, is_sticker, sticker_data
+                            file_name, file_size, file_type, timestamp
                      FROM messages WHERE id = $1`,
                     [messageId]
                 );
@@ -1006,9 +1013,7 @@ wss.on('connection', (ws) => {
                         file_name: message.file_name,
                         file_size: message.file_size,
                         file_type: message.file_type,
-                        timestamp: message.timestamp,
-                        is_sticker: message.is_sticker,
-                        sticker_data: message.sticker_data
+                        timestamp: message.timestamp
                     },
                     pinned_by: userPhone
                 };
@@ -1128,21 +1133,14 @@ wss.on('connection', (ws) => {
                     const pinnedRes = await pool.query(
                         `SELECT m.id, m.from_phone, m.to_phone, m.group_id, m.content,
                                 m.is_file, m.is_voice, m.file_name, m.file_size, m.file_type,
-                                m.timestamp, pm.pinned_by, pm.pinned_at,
-                                m.is_sticker, m.sticker_data
+                                m.timestamp, pm.pinned_by, pm.pinned_at
                          FROM pinned_messages pm
                          JOIN messages m ON pm.message_id = m.id
                          WHERE pm.chat_id = $1`,
                         [canonicalChatId]
                     );
                     if (pinnedRes.rows.length > 0) {
-                        let pinnedMsg = pinnedRes.rows[0];
-                        if (pinnedMsg.sticker_data && typeof pinnedMsg.sticker_data === 'string') {
-                            try {
-                                pinnedMsg.sticker_data = JSON.parse(pinnedMsg.sticker_data);
-                            } catch(e) {}
-                        }
-                        ws.send(JSON.stringify({ type: 'pinned_message', message: pinnedMsg, chatId: clientChatId }));
+                        ws.send(JSON.stringify({ type: 'pinned_message', message: pinnedRes.rows[0], chatId: clientChatId }));
                     } else {
                         ws.send(JSON.stringify({ type: 'pinned_message', message: null, chatId: clientChatId }));
                     }
@@ -1326,19 +1324,34 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не указаны groupId или данные для обновления' }));
                     return;
                 }
-                const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
-                if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
+                const groupRes = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
+                if (groupRes.rows.length === 0) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Группа не найдена' }));
+                    return;
+                }
+                const isCreator = groupRes.rows[0].created_by === userPhone;
+
+                const roleCheck = await pool.query('SELECT role, permissions FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
+                if (roleCheck.rows.length === 0) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
                     return;
                 }
+                const isAdmin = roleCheck.rows[0].role === 'admin';
+                const canEditInfo = isCreator || (isAdmin && (roleCheck.rows[0].permissions?.can_edit_group_info === true));
+
+                if (!canEditInfo) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав для редактирования информации группы' }));
+                    return;
+                }
+
                 if (name) {
                     await pool.query('UPDATE groups SET name = $1 WHERE id = $2', [name, groupId]);
                 }
                 if (avatar) {
                     await pool.query('UPDATE groups SET avatar = $1 WHERE id = $2', [avatar, groupId]);
                 }
-                const groupRes = await pool.query('SELECT id, name, avatar, created_by FROM groups WHERE id = $1', [groupId]);
-                const updatedGroup = groupRes.rows[0];
+                const groupResUpdated = await pool.query('SELECT id, name, avatar, created_by FROM groups WHERE id = $1', [groupId]);
+                const updatedGroup = groupResUpdated.rows[0];
                 const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
                 for (const member of membersRes.rows) {
                     const memberWs = clients.get(member.user_phone);
