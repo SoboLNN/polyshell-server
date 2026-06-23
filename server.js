@@ -1346,7 +1346,8 @@ wss.on('connection', (ws) => {
                     return;
                 }
                 const isAdmin = roleCheck.rows[0].role === 'admin';
-                const canEditInfo = isCreator || (isAdmin && (roleCheck.rows[0].permissions?.can_edit_group_info === true));
+                // ИСПРАВЛЕНИЕ: разрешаем админу редактировать, если право явно не запрещено (can_edit_group_info !== false)
+                const canEditInfo = isCreator || (isAdmin && (roleCheck.rows[0].permissions?.can_edit_group_info !== false));
 
                 if (!canEditInfo) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав для редактирования информации группы' }));
