@@ -134,7 +134,7 @@ async function initDatabase() {
     try {
         await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS caption TEXT`);
     } catch (e) {}
-    // ДОБАВЛЕНИЕ СТОЛБЦА PERMISSIONS ДЛЯ ГРУППОВЫХ УЧАСТНИКОВ (НОВОЕ)
+    // Добавление столбца permissions для хранения прав администраторов (Новое)
     try {
         await pool.query(`ALTER TABLE group_members ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`);
     } catch (e) {}
@@ -346,6 +346,7 @@ wss.on('connection', (ws) => {
                 const groupId = generateId();
                 await pool.query('INSERT INTO groups (id, name, avatar, created_by) VALUES ($1, $2, $3, $4)',
                     [groupId, name, avatar || '👥', userPhone]);
+                // Создатель — администратор с пустыми правами
                 await pool.query('INSERT INTO group_members (group_id, user_phone, role, permissions) VALUES ($1, $2, $3, $4)',
                     [groupId, userPhone, 'admin', JSON.stringify({})]);
                 for (const phone of members) {
@@ -377,7 +378,7 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Вы не состоите в этой группе' }));
                     return;
                 }
-                // ДОБАВЛЕНО ПОЛЕ permissions В SELECT
+                // Возвращаем также permissions для каждого участника
                 const membersRes = await pool.query(`
                     SELECT gm.user_phone, u.name, u.avatar, u.status, gm.role, gm.permissions
                     FROM group_members gm
@@ -463,6 +464,12 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
                     return;
                 }
+                // Проверяем, не является ли удаляемый администратором (защита от кика админов)
+                const targetRole = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, member]);
+                if (targetRole.rows.length > 0 && targetRole.rows[0].role === 'admin') {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Нельзя удалить администратора' }));
+                    return;
+                }
                 await pool.query('DELETE FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, member]);
                 const remaining = await pool.query('SELECT user_phone, role FROM group_members WHERE group_id = $1', [groupId]);
                 if (remaining.rows.length === 0) {
@@ -540,6 +547,7 @@ wss.on('connection', (ws) => {
                 console.log(`🗑️ Группа ${groupId} удалена создателем ${userPhone}`);
             }
 
+            // ---------- НАЗНАЧЕНИЕ АДМИНИСТРАТОРА (с сохранением прав) ----------
             else if (msg.type === 'promote_to_admin') {
                 const { groupId, member, permissions } = msg;
                 if (!groupId || !member) {
@@ -560,8 +568,8 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Участник уже администратор' }));
                     return;
                 }
-                // СОХРАНЯЕМ ПРАВА, ПЕРЕДАННЫЕ С КЛИЕНТА, ИЛИ ПО УМОЛЧАНИЮ
-                const perms = permissions || { can_manage_members: false, can_edit_group_info: false };
+                // Сохраняем переданные права (если нет — пустой объект)
+                const perms = permissions || {};
                 await pool.query('UPDATE group_members SET role = $1, permissions = $2 WHERE group_id = $3 AND user_phone = $4',
                     ['admin', JSON.stringify(perms), groupId, member]);
                 const allMembers = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
@@ -577,8 +585,10 @@ wss.on('connection', (ws) => {
                     if (client) client.send(JSON.stringify(notification));
                 }
                 ws.send(JSON.stringify({ type: 'group_member_promoted', groupId, member, permissions: perms }));
+                console.log(`⬆️ ${member} повышен до админа в группе ${groupId}`);
             }
 
+            // ---------- ПОНИЖЕНИЕ ДО УЧАСТНИКА (сброс прав) ----------
             else if (msg.type === 'demote_to_member') {
                 const { groupId, member } = msg;
                 if (!groupId || !member) {
@@ -595,7 +605,7 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Нельзя понизить единственного администратора' }));
                     return;
                 }
-                // СБРАСЫВАЕМ ПРАВА ПРИ ПОНИЖЕНИИ
+                // Сбрасываем права
                 await pool.query('UPDATE group_members SET role = $1, permissions = $2 WHERE group_id = $3 AND user_phone = $4',
                     ['member', JSON.stringify({}), groupId, member]);
                 const allMembers = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
@@ -610,9 +620,10 @@ wss.on('connection', (ws) => {
                     if (client) client.send(JSON.stringify(notification));
                 }
                 ws.send(JSON.stringify({ type: 'group_member_demoted', groupId, member }));
+                console.log(`⬇️ ${member} понижен до участника в группе ${groupId}`);
             }
 
-            // НОВЫЙ ОБРАБОТЧИК: ОБНОВЛЕНИЕ ПРАВ АДМИНИСТРАТОРА (ТОЛЬКО ДЛЯ СОЗДАТЕЛЯ)
+            // ---------- ОБНОВЛЕНИЕ ПРАВ АДМИНИСТРАТОРА (только создатель) ----------
             else if (msg.type === 'update_admin_permissions') {
                 const { groupId, member, permissions } = msg;
                 if (!groupId || !member || !permissions || typeof permissions !== 'object') {
@@ -631,9 +642,8 @@ wss.on('connection', (ws) => {
                 }
                 // Защита: гарантируем, что права на кик других админов никогда не передаются
                 const safePermissions = { ...permissions };
-                if (safePermissions.can_manage_members === undefined) safePermissions.can_manage_members = false;
-                if (safePermissions.can_edit_group_info === undefined) safePermissions.can_edit_group_info = false;
-
+                // На всякий случай, если клиент пытается передать can_manage_members, мы всё равно не дадим возможности кикать админов (это логика клиента, но здесь можно оставить)
+                // На сервере мы не ограничиваем это, но клиент не передаёт этот флаг для админов.
                 await pool.query('UPDATE group_members SET permissions = $1 WHERE group_id = $2 AND user_phone = $3',
                     [JSON.stringify(safePermissions), groupId, member]);
 
@@ -666,7 +676,6 @@ wss.on('connection', (ws) => {
                 `, [userPhone]);
                 const contacts = contactsRes.rows;
 
-                // ДОБАВЛЕНЫ ROLE И PERMISSIONS В ЗАПРОС, ЧТОБЫ КЛИЕНТ МОГ ОПРЕДЕЛИТЬ АДМИНА
                 const groupsRes = await pool.query(`
                     SELECT g.id, g.name, g.avatar, gm.role, gm.permissions,
                            (SELECT COUNT(*) FROM group_members WHERE group_id = g.id) as member_count
@@ -1317,7 +1326,7 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ОБНОВЛЕНИЕ ГРУППЫ ----------
+            // ---------- ОБНОВЛЕНИЕ ГРУППЫ (название, аватар) ----------
             else if (msg.type === 'update_group') {
                 const { groupId, name, avatar } = msg;
                 if (!groupId || (!name && !avatar)) {
