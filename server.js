@@ -1362,6 +1362,12 @@ wss.on('connection', (ws) => {
                 }
                 const groupResUpdated = await pool.query('SELECT id, name, avatar, created_by FROM groups WHERE id = $1', [groupId]);
                 const updatedGroup = groupResUpdated.rows[0];
+
+                // ДОБАВЛЕНИЕ: отправляем обновленные права для пользователя, чтобы клиент перерисовал UI
+                const updatedMemberInfo = await pool.query('SELECT role, permissions FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
+                const myPermissions = updatedMemberInfo.rows[0]?.permissions || {};
+                const myRole = updatedMemberInfo.rows[0]?.role || 'member';
+
                 const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
                 for (const member of membersRes.rows) {
                     const memberWs = clients.get(member.user_phone);
@@ -1374,7 +1380,14 @@ wss.on('connection', (ws) => {
                         }));
                     }
                 }
-                ws.send(JSON.stringify({ type: 'group_updated', groupId, name: updatedGroup.name, avatar: updatedGroup.avatar }));
+                ws.send(JSON.stringify({
+                    type: 'group_updated',
+                    groupId,
+                    name: updatedGroup.name,
+                    avatar: updatedGroup.avatar,
+                    myPermissions: myPermissions,
+                    myRole: myRole
+                }));
                 console.log(`👥 Группа ${groupId} обновлена участником ${userPhone}`);
             }
 
