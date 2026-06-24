@@ -547,16 +547,21 @@ wss.on('connection', (ws) => {
                 console.log(`🗑️ Группа ${groupId} удалена создателем ${userPhone}`);
             }
 
-            // ---------- НАЗНАЧЕНИЕ АДМИНИСТРАТОРА (с сохранением прав) ----------
+            // ---------- НАЗНАЧЕНИЕ АДМИНИСТРАТОРА (только создатель) ----------
             else if (msg.type === 'promote_to_admin') {
                 const { groupId, member, permissions } = msg;
                 if (!groupId || !member) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не указана группа или участник' }));
                     return;
                 }
-                const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
-                if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
+                // Проверяем, что текущий пользователь — создатель группы
+                const groupRes = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
+                if (groupRes.rows.length === 0) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Группа не найдена' }));
+                    return;
+                }
+                if (groupRes.rows[0].created_by !== userPhone) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Только создатель группы может назначать администраторов' }));
                     return;
                 }
                 const targetCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, member]);
@@ -585,19 +590,33 @@ wss.on('connection', (ws) => {
                     if (client) client.send(JSON.stringify(notification));
                 }
                 ws.send(JSON.stringify({ type: 'group_member_promoted', groupId, member, permissions: perms }));
-                console.log(`⬆️ ${member} повышен до админа в группе ${groupId}`);
+                console.log(`⬆️ ${member} повышен до админа в группе ${groupId} (создатель ${userPhone})`);
             }
 
-            // ---------- ПОНИЖЕНИЕ ДО УЧАСТНИКА (сброс прав) ----------
+            // ---------- ПОНИЖЕНИЕ ДО УЧАСТНИКА (только создатель) ----------
             else if (msg.type === 'demote_to_member') {
                 const { groupId, member } = msg;
                 if (!groupId || !member) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не указана группа или участник' }));
                     return;
                 }
-                const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
-                if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
+                // Проверяем, что текущий пользователь — создатель группы
+                const groupRes = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
+                if (groupRes.rows.length === 0) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Группа не найдена' }));
+                    return;
+                }
+                if (groupRes.rows[0].created_by !== userPhone) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Только создатель группы может понижать администраторов' }));
+                    return;
+                }
+                const targetCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, member]);
+                if (targetCheck.rows.length === 0) {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Участник не найден' }));
+                    return;
+                }
+                if (targetCheck.rows[0].role !== 'admin') {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Участник не является администратором' }));
                     return;
                 }
                 const admins = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1 AND role = $2', [groupId, 'admin']);
@@ -620,7 +639,7 @@ wss.on('connection', (ws) => {
                     if (client) client.send(JSON.stringify(notification));
                 }
                 ws.send(JSON.stringify({ type: 'group_member_demoted', groupId, member }));
-                console.log(`⬇️ ${member} понижен до участника в группе ${groupId}`);
+                console.log(`⬇️ ${member} понижен до участника в группе ${groupId} (создатель ${userPhone})`);
             }
 
             // ---------- ОБНОВЛЕНИЕ ПРАВ АДМИНИСТРАТОРА (только создатель) ----------
@@ -640,10 +659,8 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Указанный пользователь не является администратором' }));
                     return;
                 }
-                // Защита: гарантируем, что права на кик других админов никогда не передаются
+                // Защита: гарантируем, что права на кик других админов никогда не передаются (это логика клиента, но здесь можно оставить)
                 const safePermissions = { ...permissions };
-                // На всякий случай, если клиент пытается передать can_manage_members, мы всё равно не дадим возможности кикать админов (это логика клиента, но здесь можно оставить)
-                // На сервере мы не ограничиваем это, но клиент не передаёт этот флаг для админов.
                 await pool.query('UPDATE group_members SET permissions = $1 WHERE group_id = $2 AND user_phone = $3',
                     [JSON.stringify(safePermissions), groupId, member]);
 
@@ -659,7 +676,7 @@ wss.on('connection', (ws) => {
                     if (client) client.send(JSON.stringify(notification));
                 }
                 ws.send(JSON.stringify({ type: 'admin_permissions_updated', groupId, member, permissions: safePermissions }));
-                console.log(`🔑 Права администратора ${member} в группе ${groupId} обновлены на ${JSON.stringify(safePermissions)}`);
+                console.log(`🔑 Права администратора ${member} в группе ${groupId} обновлены на ${JSON.stringify(safePermissions)} (создатель ${userPhone})`);
             }
 
             // ---------- ПОЛУЧЕНИЕ СПИСКА ЧАТОВ ----------
@@ -1346,7 +1363,7 @@ wss.on('connection', (ws) => {
                     return;
                 }
                 const isAdmin = roleCheck.rows[0].role === 'admin';
-                // ИСПРАВЛЕНИЕ: разрешаем админу редактировать, если право явно не запрещено (can_edit_group_info !== false)
+                // Разрешаем админу редактировать, если право явно не запрещено (can_edit_group_info !== false)
                 const canEditInfo = isCreator || (isAdmin && (roleCheck.rows[0].permissions?.can_edit_group_info !== false));
 
                 if (!canEditInfo) {
@@ -1363,11 +1380,7 @@ wss.on('connection', (ws) => {
                 const groupResUpdated = await pool.query('SELECT id, name, avatar, created_by FROM groups WHERE id = $1', [groupId]);
                 const updatedGroup = groupResUpdated.rows[0];
 
-                // ДОБАВЛЕНИЕ: отправляем обновленные права для пользователя, чтобы клиент перерисовал UI
-                const updatedMemberInfo = await pool.query('SELECT role, permissions FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
-                const myPermissions = updatedMemberInfo.rows[0]?.permissions || {};
-                const myRole = updatedMemberInfo.rows[0]?.role || 'member';
-
+                // Отправляем обновленные данные всем участникам
                 const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
                 for (const member of membersRes.rows) {
                     const memberWs = clients.get(member.user_phone);
@@ -1380,13 +1393,12 @@ wss.on('connection', (ws) => {
                         }));
                     }
                 }
+                // Также отправляем подтверждение текущему пользователю
                 ws.send(JSON.stringify({
                     type: 'group_updated',
                     groupId,
                     name: updatedGroup.name,
-                    avatar: updatedGroup.avatar,
-                    myPermissions: myPermissions,
-                    myRole: myRole
+                    avatar: updatedGroup.avatar
                 }));
                 console.log(`👥 Группа ${groupId} обновлена участником ${userPhone}`);
             }
