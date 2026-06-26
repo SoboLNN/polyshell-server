@@ -134,9 +134,6 @@ async function initDatabase() {
     try {
         await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS caption TEXT`);
     } catch (e) {}
-    try {
-        await pool.query(`ALTER TABLE group_members ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`);
-    } catch (e) {}
 
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_from_phone ON messages(from_phone)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_to_phone ON messages(to_phone)`);
@@ -345,14 +342,14 @@ wss.on('connection', (ws) => {
                 const groupId = generateId();
                 await pool.query('INSERT INTO groups (id, name, avatar, created_by) VALUES ($1, $2, $3, $4)',
                     [groupId, name, avatar || '👥', userPhone]);
-                await pool.query('INSERT INTO group_members (group_id, user_phone, role, permissions) VALUES ($1, $2, $3, $4)',
-                    [groupId, userPhone, 'admin', JSON.stringify({})]);
+                await pool.query('INSERT INTO group_members (group_id, user_phone, role) VALUES ($1, $2, $3)',
+                    [groupId, userPhone, 'admin']);
                 for (const phone of members) {
                     if (phone === userPhone) continue;
                     const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [phone]);
                     if (userExists.rows.length === 0) continue;
-                    await pool.query('INSERT INTO group_members (group_id, user_phone, role, permissions) VALUES ($1, $2, $3, $4)',
-                        [groupId, phone, 'member', JSON.stringify({})]);
+                    await pool.query('INSERT INTO group_members (group_id, user_phone, role) VALUES ($1, $2, $3)',
+                        [groupId, phone, 'member']);
                 }
                 const group = { id: groupId, name, avatar: avatar || '👥', type: 'group' };
                 const allMembers = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
@@ -377,7 +374,7 @@ wss.on('connection', (ws) => {
                     return;
                 }
                 const membersRes = await pool.query(`
-                    SELECT gm.user_phone, u.name, u.avatar, u.status, gm.role, gm.permissions
+                    SELECT gm.user_phone, u.name, u.avatar, u.status, gm.role
                     FROM group_members gm
                     JOIN users u ON gm.user_phone = u.phone
                     WHERE gm.group_id = $1
@@ -394,29 +391,18 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не указаны группа или участники' }));
                     return;
                 }
-                // Проверка прав на добавление участников (создатель или админ с правом can_manage_members)
-                const roleCheck = await pool.query('SELECT role, permissions FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
-                if (roleCheck.rows.length === 0) {
+                const memberCheck = await pool.query('SELECT 1 FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
+                if (memberCheck.rows.length === 0) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Вы не состоите в этой группе' }));
                     return;
                 }
-                const role = roleCheck.rows[0].role;
-                const permissions = roleCheck.rows[0].permissions || {};
-                const groupRes = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
-                const isCreator = groupRes.rows.length > 0 && groupRes.rows[0].created_by === userPhone;
-                const canManage = isCreator || (role === 'admin' && permissions.can_manage_members === true);
-                if (!canManage) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав для добавления участников' }));
-                    return;
-                }
-
                 const added = [];
                 for (const phone of members) {
                     const userExists = await pool.query('SELECT phone FROM users WHERE phone = $1', [phone]);
                     if (userExists.rows.length === 0) continue;
                     try {
-                        await pool.query('INSERT INTO group_members (group_id, user_phone, role, permissions) VALUES ($1, $2, $3, $4)',
-                            [groupId, phone, 'member', JSON.stringify({})]);
+                        await pool.query('INSERT INTO group_members (group_id, user_phone, role) VALUES ($1, $2, $3)',
+                            [groupId, phone, 'member']);
                         added.push(phone);
                     } catch (e) {}
                 }
@@ -451,7 +437,7 @@ wss.on('connection', (ws) => {
                         const adminsLeft = remaining.rows.filter(r => r.role === 'admin');
                         if (adminsLeft.length === 0) {
                             const newAdmin = remaining.rows[0].user_phone;
-                            await pool.query('UPDATE group_members SET role = $1, permissions = $2 WHERE group_id = $3 AND user_phone = $4', ['admin', JSON.stringify({}), groupId, newAdmin]);
+                            await pool.query('UPDATE group_members SET role = $1 WHERE group_id = $2 AND user_phone = $3', ['admin', groupId, newAdmin]);
                             await pool.query('UPDATE groups SET created_by = $1 WHERE id = $2', [newAdmin, groupId]);
                         }
                         const notification = {
@@ -467,25 +453,9 @@ wss.on('connection', (ws) => {
                     }
                     return;
                 }
-
-                // Проверка прав на удаление участника (создатель или админ с правом can_manage_members)
-                const roleCheck = await pool.query('SELECT role, permissions FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
+                const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
                 if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
                     ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
-                    return;
-                }
-                const permissions = roleCheck.rows[0].permissions || {};
-                const groupRes = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
-                const isCreator = groupRes.rows.length > 0 && groupRes.rows[0].created_by === userPhone;
-                const canManage = isCreator || (permissions.can_manage_members === true);
-                if (!canManage) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав для удаления участников' }));
-                    return;
-                }
-
-                const targetRole = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, member]);
-                if (targetRole.rows.length > 0 && targetRole.rows[0].role === 'admin') {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Нельзя удалить администратора' }));
                     return;
                 }
                 await pool.query('DELETE FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, member]);
@@ -524,7 +494,7 @@ wss.on('connection', (ws) => {
                     const adminsLeft = remaining.rows.filter(r => r.role === 'admin');
                     if (adminsLeft.length === 0) {
                         const newAdmin = remaining.rows[0].user_phone;
-                        await pool.query('UPDATE group_members SET role = $1, permissions = $2 WHERE group_id = $3 AND user_phone = $4', ['admin', JSON.stringify({}), groupId, newAdmin]);
+                        await pool.query('UPDATE group_members SET role = $1 WHERE group_id = $2 AND user_phone = $3', ['admin', groupId, newAdmin]);
                         await pool.query('UPDATE groups SET created_by = $1 WHERE id = $2', [newAdmin, groupId]);
                     }
                     const notification = {
@@ -565,20 +535,15 @@ wss.on('connection', (ws) => {
                 console.log(`🗑️ Группа ${groupId} удалена создателем ${userPhone}`);
             }
 
-            // ---------- НАЗНАЧЕНИЕ АДМИНИСТРАТОРА (только создатель) ----------
             else if (msg.type === 'promote_to_admin') {
-                const { groupId, member, permissions } = msg;
+                const { groupId, member } = msg;
                 if (!groupId || !member) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не указана группа или участник' }));
                     return;
                 }
-                const groupRes = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
-                if (groupRes.rows.length === 0) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Группа не найдена' }));
-                    return;
-                }
-                if (groupRes.rows[0].created_by !== userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Только создатель группы может назначать администраторов' }));
+                const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
+                if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
                     return;
                 }
                 const targetCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, member]);
@@ -590,48 +555,30 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Участник уже администратор' }));
                     return;
                 }
-                const perms = permissions || {};
-                await pool.query('UPDATE group_members SET role = $1, permissions = $2 WHERE group_id = $3 AND user_phone = $4',
-                    ['admin', JSON.stringify(perms), groupId, member]);
+                await pool.query('UPDATE group_members SET role = $1 WHERE group_id = $2 AND user_phone = $3', ['admin', groupId, member]);
                 const allMembers = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
                 const notification = {
                     type: 'group_member_promoted',
                     groupId,
                     member,
-                    newRole: 'admin',
-                    permissions: perms
+                    newRole: 'admin'
                 };
                 for (const row of allMembers.rows) {
                     const client = clients.get(row.user_phone);
                     if (client) client.send(JSON.stringify(notification));
                 }
-                ws.send(JSON.stringify({ type: 'group_member_promoted', groupId, member, permissions: perms }));
-                console.log(`⬆️ ${member} повышен до админа в группе ${groupId} (создатель ${userPhone})`);
+                ws.send(JSON.stringify({ type: 'group_member_promoted', groupId, member }));
             }
 
-            // ---------- ПОНИЖЕНИЕ ДО УЧАСТНИКА (только создатель) ----------
             else if (msg.type === 'demote_to_member') {
                 const { groupId, member } = msg;
                 if (!groupId || !member) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не указана группа или участник' }));
                     return;
                 }
-                const groupRes = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
-                if (groupRes.rows.length === 0) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Группа не найдена' }));
-                    return;
-                }
-                if (groupRes.rows[0].created_by !== userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Только создатель группы может понижать администраторов' }));
-                    return;
-                }
-                const targetCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, member]);
-                if (targetCheck.rows.length === 0) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Участник не найден' }));
-                    return;
-                }
-                if (targetCheck.rows[0].role !== 'admin') {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Участник не является администратором' }));
+                const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
+                if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
+                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
                     return;
                 }
                 const admins = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1 AND role = $2', [groupId, 'admin']);
@@ -639,8 +586,7 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Нельзя понизить единственного администратора' }));
                     return;
                 }
-                await pool.query('UPDATE group_members SET role = $1, permissions = $2 WHERE group_id = $3 AND user_phone = $4',
-                    ['member', JSON.stringify({}), groupId, member]);
+                await pool.query('UPDATE group_members SET role = $1 WHERE group_id = $2 AND user_phone = $3', ['member', groupId, member]);
                 const allMembers = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
                 const notification = {
                     type: 'group_member_demoted',
@@ -653,43 +599,6 @@ wss.on('connection', (ws) => {
                     if (client) client.send(JSON.stringify(notification));
                 }
                 ws.send(JSON.stringify({ type: 'group_member_demoted', groupId, member }));
-                console.log(`⬇️ ${member} понижен до участника в группе ${groupId} (создатель ${userPhone})`);
-            }
-
-            // ---------- ОБНОВЛЕНИЕ ПРАВ АДМИНИСТРАТОРА (только создатель) ----------
-            else if (msg.type === 'update_admin_permissions') {
-                const { groupId, member, permissions } = msg;
-                if (!groupId || !member || !permissions || typeof permissions !== 'object') {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Не указаны группа, участник или права' }));
-                    return;
-                }
-                const groupRes = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
-                if (groupRes.rows.length === 0 || groupRes.rows[0].created_by !== userPhone) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Только создатель группы может изменять права администраторов' }));
-                    return;
-                }
-                const targetCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, member]);
-                if (targetCheck.rows.length === 0 || targetCheck.rows[0].role !== 'admin') {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Указанный пользователь не является администратором' }));
-                    return;
-                }
-                const safePermissions = { ...permissions };
-                await pool.query('UPDATE group_members SET permissions = $1 WHERE group_id = $2 AND user_phone = $3',
-                    [JSON.stringify(safePermissions), groupId, member]);
-
-                const allMembers = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
-                const notification = {
-                    type: 'admin_permissions_updated',
-                    groupId,
-                    member,
-                    permissions: safePermissions
-                };
-                for (const row of allMembers.rows) {
-                    const client = clients.get(row.user_phone);
-                    if (client) client.send(JSON.stringify(notification));
-                }
-                ws.send(JSON.stringify({ type: 'admin_permissions_updated', groupId, member, permissions: safePermissions }));
-                console.log(`🔑 Права администратора ${member} в группе ${groupId} обновлены на ${JSON.stringify(safePermissions)} (создатель ${userPhone})`);
             }
 
             // ---------- ПОЛУЧЕНИЕ СПИСКА ЧАТОВ ----------
@@ -707,7 +616,7 @@ wss.on('connection', (ws) => {
                 const contacts = contactsRes.rows;
 
                 const groupsRes = await pool.query(`
-                    SELECT g.id, g.name, g.avatar, gm.role, gm.permissions,
+                    SELECT g.id, g.name, g.avatar,
                            (SELECT COUNT(*) FROM group_members WHERE group_id = g.id) as member_count
                     FROM groups g
                     JOIN group_members gm ON g.id = gm.group_id
@@ -717,8 +626,6 @@ wss.on('connection', (ws) => {
                     id: r.id,
                     name: r.name,
                     avatar: r.avatar,
-                    role: r.role,
-                    permissions: r.permissions || {},
                     memberCount: parseInt(r.member_count)
                 }));
 
@@ -1314,9 +1221,11 @@ wss.on('connection', (ws) => {
                     await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE phone = $${idx}`, values);
                 }
 
+                // Получаем обновлённые данные пользователя
                 const updatedUserRes = await pool.query('SELECT phone, name, avatar, status, email, settings, last_seen FROM users WHERE phone = $1', [user.phone]);
                 const updatedUser = updatedUserRes.rows[0];
 
+                // Собираем получателей: контакты и участники групп
                 const recipients = new Set();
 
                 const contactsRes = await pool.query('SELECT user_phone FROM contacts WHERE contact_phone = $1', [user.phone]);
@@ -1354,42 +1263,26 @@ wss.on('connection', (ws) => {
                 }
             }
 
-            // ---------- ОБНОВЛЕНИЕ ГРУППЫ (название, аватар) ----------
+            // ---------- ОБНОВЛЕНИЕ ГРУППЫ ----------
             else if (msg.type === 'update_group') {
                 const { groupId, name, avatar } = msg;
                 if (!groupId || (!name && !avatar)) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Не указаны groupId или данные для обновления' }));
                     return;
                 }
-                const groupRes = await pool.query('SELECT created_by FROM groups WHERE id = $1', [groupId]);
-                if (groupRes.rows.length === 0) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Группа не найдена' }));
-                    return;
-                }
-                const isCreator = groupRes.rows[0].created_by === userPhone;
-
-                const roleCheck = await pool.query('SELECT role, permissions FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
-                if (roleCheck.rows.length === 0) {
+                const roleCheck = await pool.query('SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2', [groupId, userPhone]);
+                if (roleCheck.rows.length === 0 || roleCheck.rows[0].role !== 'admin') {
                     ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав' }));
                     return;
                 }
-                const isAdmin = roleCheck.rows[0].role === 'admin';
-                const canEditInfo = isCreator || (isAdmin && (roleCheck.rows[0].permissions?.can_edit_group_info !== false));
-
-                if (!canEditInfo) {
-                    ws.send(JSON.stringify({ type: 'error', error: 'Недостаточно прав для редактирования информации группы' }));
-                    return;
-                }
-
                 if (name) {
                     await pool.query('UPDATE groups SET name = $1 WHERE id = $2', [name, groupId]);
                 }
                 if (avatar) {
                     await pool.query('UPDATE groups SET avatar = $1 WHERE id = $2', [avatar, groupId]);
                 }
-                const groupResUpdated = await pool.query('SELECT id, name, avatar, created_by FROM groups WHERE id = $1', [groupId]);
-                const updatedGroup = groupResUpdated.rows[0];
-
+                const groupRes = await pool.query('SELECT id, name, avatar, created_by FROM groups WHERE id = $1', [groupId]);
+                const updatedGroup = groupRes.rows[0];
                 const membersRes = await pool.query('SELECT user_phone FROM group_members WHERE group_id = $1', [groupId]);
                 for (const member of membersRes.rows) {
                     const memberWs = clients.get(member.user_phone);
@@ -1402,12 +1295,7 @@ wss.on('connection', (ws) => {
                         }));
                     }
                 }
-                ws.send(JSON.stringify({
-                    type: 'group_updated',
-                    groupId,
-                    name: updatedGroup.name,
-                    avatar: updatedGroup.avatar
-                }));
+                ws.send(JSON.stringify({ type: 'group_updated', groupId, name: updatedGroup.name, avatar: updatedGroup.avatar }));
                 console.log(`👥 Группа ${groupId} обновлена участником ${userPhone}`);
             }
 
