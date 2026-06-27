@@ -89,7 +89,9 @@ async function initDatabase() {
             timestamp TIMESTAMP DEFAULT NOW(),
             is_multiple_media BOOLEAN DEFAULT false,
             attachments JSONB,
-            caption TEXT
+            caption TEXT,
+            is_sticker BOOLEAN DEFAULT false,
+            sticker_data TEXT
         )
     `);
     await pool.query(`
@@ -136,6 +138,13 @@ async function initDatabase() {
     } catch (e) {}
     try {
         await pool.query(`ALTER TABLE group_members ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`);
+    } catch (e) {}
+    // Добавляем колонки для стикеров
+    try {
+        await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_sticker BOOLEAN DEFAULT FALSE`);
+    } catch (e) {}
+    try {
+        await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS sticker_data TEXT`);
     } catch (e) {}
 
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_from_phone ON messages(from_phone)`);
@@ -555,6 +564,7 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Группа не найдена' }));
                     return;
                 }
+                // ТОЛЬКО СОЗДАТЕЛЬ может назначать администраторов
                 if (groupRes.rows[0].created_by !== userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Только создатель группы может назначать администраторов' }));
                     return;
@@ -599,6 +609,7 @@ wss.on('connection', (ws) => {
                     ws.send(JSON.stringify({ type: 'error', error: 'Группа не найдена' }));
                     return;
                 }
+                // ТОЛЬКО СОЗДАТЕЛЬ может понижать администраторов
                 if (groupRes.rows[0].created_by !== userPhone) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Только создатель группы может понижать администраторов' }));
                     return;
@@ -741,7 +752,7 @@ wss.on('connection', (ws) => {
 
             // ---------- ОТПРАВКА СООБЩЕНИЯ ----------
             else if (msg.type === 'chat_message') {
-                const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType, repliedTo, isMultipleMedia, attachments, caption } = msg;
+                const { id, from, fromName, to, groupId, content, timestamp, isFile, isVoice, fileName, fileSize, fileType, repliedTo, isMultipleMedia, attachments, caption, isSticker, stickerData } = msg;
                 if (!from || (!to && !groupId)) {
                     ws.send(JSON.stringify({ type: 'error', error: 'Отправитель и получатель/группа обязательны' }));
                     return;
@@ -775,10 +786,21 @@ wss.on('connection', (ws) => {
                     }
                 }
 
+                // Подготовка данных для стикера
+                let stickerDataJson = null;
+                if (isSticker && stickerData) {
+                    try {
+                        stickerDataJson = typeof stickerData === 'string' ? stickerData : JSON.stringify(stickerData);
+                    } catch (err) {
+                        console.error('Ошибка при JSON.stringify(stickerData):', err);
+                        stickerDataJson = null;
+                    }
+                }
+
                 await pool.query(
-                    `INSERT INTO messages (id, from_phone, to_phone, group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp, replied_to, is_multiple_media, attachments, caption)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-                    [id, from, to || null, groupId || null, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString(), repliedTo || null, isMultipleMedia || false, attachmentsJson, caption || null]
+                    `INSERT INTO messages (id, from_phone, to_phone, group_id, content, encrypted, is_file, is_voice, file_name, file_size, file_type, timestamp, replied_to, is_multiple_media, attachments, caption, is_sticker, sticker_data)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+                    [id, from, to || null, groupId || null, content, false, isFile || false, isVoice || false, fileName, fileSize, fileType, timestamp || new Date().toISOString(), repliedTo || null, isMultipleMedia || false, attachmentsJson, caption || null, isSticker || false, stickerDataJson]
                 );
 
                 if (to) {
@@ -791,7 +813,9 @@ wss.on('connection', (ws) => {
                             fileName, fileSize, fileType, repliedTo,
                             isMultipleMedia: isMultipleMedia || false,
                             attachments: attachments || null,
-                            caption: caption || null
+                            caption: caption || null,
+                            isSticker: isSticker || false,
+                            stickerData: stickerDataJson
                         }));
                         await pool.query('UPDATE messages SET delivered = true WHERE id = $1', [id]);
                         ws.send(JSON.stringify({ type: 'message_delivered', messageId: id, to }));
@@ -813,7 +837,9 @@ wss.on('connection', (ws) => {
                                 fileName, fileSize, fileType, repliedTo,
                                 isMultipleMedia: isMultipleMedia || false,
                                 attachments: attachments || null,
-                                caption: caption || null
+                                caption: caption || null,
+                                isSticker: isSticker || false,
+                                stickerData: stickerDataJson
                             }));
                             deliveredCount++;
                         } else {
@@ -887,7 +913,8 @@ wss.on('connection', (ws) => {
                                 content, encrypted, is_file, is_voice,
                                 file_name, file_size, file_type,
                                 delivered, read, timestamp, replied_to, edited,
-                                is_multiple_media, attachments, caption
+                                is_multiple_media, attachments, caption,
+                                is_sticker, sticker_data
                          FROM messages
                          WHERE (from_phone = $1 OR to_phone = $1)
                            AND group_id IS NULL
@@ -903,6 +930,14 @@ wss.on('connection', (ws) => {
                             } catch(e) {
                                 console.error('Ошибка парсинга attachments для сообщения', m.id, e);
                                 m.attachments = null;
+                            }
+                        }
+                        if (m.sticker_data && typeof m.sticker_data === 'string') {
+                            try {
+                                m.sticker_data = JSON.parse(m.sticker_data);
+                            } catch(e) {
+                                console.error('Ошибка парсинга sticker_data для сообщения', m.id, e);
+                                m.sticker_data = null;
                             }
                         }
                         return m;
@@ -928,7 +963,8 @@ wss.on('connection', (ws) => {
                                 m.content, m.encrypted, m.is_file, m.is_voice,
                                 m.file_name, m.file_size, m.file_type,
                                 m.delivered, m.read, m.timestamp, m.replied_to, m.edited,
-                                m.is_multiple_media, m.attachments, m.caption
+                                m.is_multiple_media, m.attachments, m.caption,
+                                m.is_sticker, m.sticker_data
                          FROM messages m
                          INNER JOIN group_members gm ON m.group_id = gm.group_id
                          WHERE gm.user_phone = $1
@@ -944,6 +980,14 @@ wss.on('connection', (ws) => {
                             } catch(e) {
                                 console.error('Ошибка парсинга attachments для сообщения', m.id, e);
                                 m.attachments = null;
+                            }
+                        }
+                        if (m.sticker_data && typeof m.sticker_data === 'string') {
+                            try {
+                                m.sticker_data = JSON.parse(m.sticker_data);
+                            } catch(e) {
+                                console.error('Ошибка парсинга sticker_data для сообщения', m.id, e);
+                                m.sticker_data = null;
                             }
                         }
                         return m;
@@ -1398,7 +1442,7 @@ wss.on('connection', (ws) => {
                 }
                 // Проверяем, что пользователь состоит в группе и является админом или создателем
                 const memberCheck = await pool.query(
-                    'SELECT role FROM group_members WHERE group_id = $1 AND user_phone = $2',
+                    'SELECT role, permissions FROM group_members WHERE group_id = $1 AND user_phone = $2',
                     [groupId, userPhone]
                 );
                 if (memberCheck.rows.length === 0) {
